@@ -1,0 +1,5 @@
+".\Objects\main.obj",
+".\Objects\romhandler.obj",
+".\Objects\crc.obj" 
+TO ".\Objects\VoltageIndicator" 
+PRINT(".\Listings\VoltageIndicator.m51") RAMSIZE(256) 

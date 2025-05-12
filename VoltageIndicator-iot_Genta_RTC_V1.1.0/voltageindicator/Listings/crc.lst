@@ -1,0 +1,123 @@
+C51 COMPILER V9.54   CRC                                                                   05/07/2025 14:49:15 PAGE 1   
+
+
+C51 COMPILER V9.54, COMPILATION OF MODULE CRC
+OBJECT MODULE PLACED IN .\Objects\crc.obj
+COMPILER INVOKED BY: D:\Keil\C51\BIN\C51.EXE crc.c OPTIMIZE(8,SPEED) BROWSE DEBUG OBJECTEXTEND CODE PRINT(.\Listings\crc
+                    -.lst) OBJECT(.\Objects\crc.obj)
+
+line level    source
+
+   1          #include "crc.h"
+   2          
+   3          unsigned int MODBUS_CRC16(unsigned char *p, char n) {
+   4   1              unsigned char i;
+   5   1              unsigned int crc16;
+   6   1              crc16 = 0xffff; //预置 16 位 CRC 寄存器为 0xffff（即全为 1）
+   7   1              do
+   8   1              {
+   9   2                      crc16 ^= (unsigned int)*p; //把 8 位数据与 16 位 CRC 寄存器的低位相异或，把结果放于
+             - CRC 寄存器
+  10   2                      for(i=0; i<8; i++) //8 位数据
+  11   2                      {
+  12   3                              //if(crc16 & 1) crc16 = (crc16 >> 1) ^ 0xA001; //如果最低位为 0，把 CRC 寄存器的内容右�
+             -�一位
+  13   3                              if(crc16 & 1) crc16 = (crc16 >> 1) ^ MODBUS_CRC16_POLY;
+  14   3                              //(朝低位)，用 0 填补最高位，
+  15   3                              //再异或多项式 0xA001
+  16   3                              else crc16 >>= 1; //如果最低位为 0，把 CRC 寄存器的内容右移一位
+  17   3                              //(朝低位)，用 0 填补最高位
+  18   3                      }
+  19   2                      p++;
+  20   2              }while(--n != 0);
+  21   1              return (crc16);
+  22   1      }
+*** WARNING C316 IN LINE 22 OF crc.c: unterminated conditionals
+C51 COMPILER V9.54   CRC                                                                   05/07/2025 14:49:15 PAGE 2   
+
+ASSEMBLY LISTING OF GENERATED OBJECT CODE
+
+
+             ; FUNCTION _MODBUS_CRC16 (BEGIN)
+                                           ; SOURCE LINE # 3
+;---- Variable 'p' assigned to Register 'R1/R2/R3' ----
+;---- Variable 'n' assigned to Register 'R5' ----
+                                           ; SOURCE LINE # 6
+0000 74FF              MOV     A,#0FFH
+0002 F500        R     MOV     crc16,A
+0004 F500        R     MOV     crc16+01H,A
+0006         ?C0003:
+                                           ; SOURCE LINE # 8
+                                           ; SOURCE LINE # 9
+0006 120000      E     LCALL   ?C?CLDPTR
+0009 6200        R     XRL     crc16+01H,A
+000B E4                CLR     A
+                                           ; SOURCE LINE # 10
+;---- Variable 'i' assigned to Register 'R4' ----
+000C FC                MOV     R4,A
+000D         ?C0004:
+                                           ; SOURCE LINE # 11
+                                           ; SOURCE LINE # 13
+000D E500        R     MOV     A,crc16+01H
+000F 30E015            JNB     ACC.0,?C0007
+0012 E500        R     MOV     A,crc16
+0014 C3                CLR     C
+0015 13                RRC     A
+0016 FE                MOV     R6,A
+0017 E500        R     MOV     A,crc16+01H
+0019 13                RRC     A
+001A FF                MOV     R7,A
+001B EE                MOV     A,R6
+001C 64A0              XRL     A,#0A0H
+001E F500        R     MOV     crc16,A
+0020 EF                MOV     A,R7
+0021 6401              XRL     A,#01H
+0023 F500        R     MOV     crc16+01H,A
+0025 800B              SJMP    ?C0006
+0027         ?C0007:
+                                           ; SOURCE LINE # 16
+0027 E500        R     MOV     A,crc16
+0029 C3                CLR     C
+002A 13                RRC     A
+002B F500        R     MOV     crc16,A
+002D E500        R     MOV     A,crc16+01H
+002F 13                RRC     A
+0030 F500        R     MOV     crc16+01H,A
+                                           ; SOURCE LINE # 18
+0032         ?C0006:
+0032 0C                INC     R4
+0033 BC08D7            CJNE    R4,#08H,?C0004
+0036         ?C0005:
+                                           ; SOURCE LINE # 19
+0036 7401              MOV     A,#01H
+0038 29                ADD     A,R1
+0039 F9                MOV     R1,A
+003A E4                CLR     A
+003B 3A                ADDC    A,R2
+003C FA                MOV     R2,A
+                                           ; SOURCE LINE # 20
+003D DDC7              DJNZ    R5,?C0003
+C51 COMPILER V9.54   CRC                                                                   05/07/2025 14:49:15 PAGE 3   
+
+                                           ; SOURCE LINE # 21
+003F AE00        R     MOV     R6,crc16
+0041 AF00        R     MOV     R7,crc16+01H
+                                           ; SOURCE LINE # 22
+0043         ?C0009:
+0043 22                RET     
+             ; FUNCTION _MODBUS_CRC16 (END)
+
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =     68    ----
+   CONSTANT SIZE    =   ----    ----
+   XDATA SIZE       =   ----    ----
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =   ----       2
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =   ----    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  1 WARNING(S),  0 ERROR(S)

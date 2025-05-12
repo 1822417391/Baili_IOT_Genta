@@ -1,0 +1,1037 @@
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 1   
+
+
+C51 COMPILER V9.54, COMPILATION OF MODULE ROMHANDLER
+OBJECT MODULE PLACED IN .\Objects\romhandler.obj
+COMPILER INVOKED BY: D:\Keil\C51\BIN\C51.EXE romhandler.c OPTIMIZE(8,SPEED) BROWSE DEBUG OBJECTEXTEND CODE PRINT(.\Listi
+                    -ngs\romhandler.lst) OBJECT(.\Objects\romhandler.obj)
+
+line level    source
+
+   1          #include "romhandler.h"
+   2          
+   3          extern char xdata WAKE_MODE;  // 当前唤醒模式
+   4          extern char xdata LAST_WAKE_MIN;         // 上次唤醒的分钟数
+   5          
+   6          void InitROM() {
+   7   1          IAP_CONTR = 0x80; //使能 IAP
+   8   1          IAP_TPS = 11; //设置等待参数 12MHz
+   9   1      }
+  10          
+  11          void IapIdle() {
+  12   1          IAP_CONTR = 0; //关闭 IAP 功能
+  13   1          IAP_CMD = 0; //清除命令寄存器
+  14   1          IAP_TRIG = 0; //清除触发寄存器
+  15   1          IAP_ADDRH = 0x80; //将地址设置到非 IAP 区域
+  16   1          IAP_ADDRL = 0;
+  17   1      }
+  18          
+  19          
+  20          
+  21          void IapReadWithSize(int addr, int size, char* res) {
+  22   1          int tmpAddr;
+  23   1          int i;
+  24   1      
+  25   1          InitROM();
+  26   1          i = 0;
+  27   1          while(i < size) {
+  28   2              tmpAddr = addr + i;
+  29   2              IAP_CMD = 1;
+  30   2              IAP_ADDRL = tmpAddr; //设置 IAP 低地址
+  31   2              IAP_ADDRH = tmpAddr >> 8; //设置 IAP 高地址
+  32   2              IAP_TRIG = 0x5a; //写触发命令(0x5a)
+  33   2              IAP_TRIG = 0xa5; //写触发命令(0xa5)
+  34   2              _nop_();
+  35   2              _nop_();
+  36   2              res[i] =  IAP_DATA;
+  37   2              i++;
+  38   2          }
+  39   1          IapIdle(); //关闭 IAP 功能
+  40   1      }
+  41          
+  42          
+  43          
+  44          void IapMultiWrite(int addr, char *dat, char offset, char size) {
+  45   1          char i;
+  46   1          int tmpAddr;
+  47   1      
+  48   1          InitROM();
+  49   1          i = 0;
+  50   1          while(i < size) {
+  51   2              tmpAddr = addr + i;
+  52   2              IAP_CMD = 2; //设置 IAP 写命令
+  53   2              IAP_ADDRL = tmpAddr; //设置 IAP 低地址
+  54   2              IAP_ADDRH = tmpAddr >> 8; //设置 IAP 高地址
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 2   
+
+  55   2              IAP_DATA = dat[i + offset]; //写 IAP 数据
+  56   2              IAP_TRIG = 0x5a; //写触发命令(0x5a)
+  57   2              IAP_TRIG = 0xa5; //写触发命令(0xa5)
+  58   2              _nop_();
+  59   2              _nop_();
+  60   2              i++;
+  61   2          }
+  62   1          IapIdle(); //关闭 IAP 功能
+  63   1      }
+  64          
+  65          void IapErase(int addr) {
+  66   1          InitROM();
+  67   1          IAP_CMD =3; //设置 IAP 擦除命令
+  68   1          IAP_ADDRL = addr; //设置 IAP 低地址
+  69   1          IAP_ADDRH = addr >> 8; //设置 IAP 高地址
+  70   1          IAP_TRIG = 0x5a;
+  71   1          //写触发命令(0x5a)
+  72   1          IAP_TRIG = 0xa5; //写触发命令(0xa5)
+  73   1          _nop_(); //
+  74   1          IapIdle(); //关闭 IAP 功能
+  75   1      }
+  76          
+  77          /**
+  78           * @brief 从ROM读取2字节数据并转换为int类型
+  79           * @param addr 要读取的起始地址
+  80           * @param res 存储结果的指针
+  81           */
+  82          void IapGet2byteData(int addr, int *res) {
+  83   1          char dat[2];
+  84   1      
+  85   1          // 读取2字节数据
+  86   1          IapReadWithSize(addr, 2, dat);
+  87   1      
+  88   1          // 将2字节数据组合为int
+  89   1          *res = dat[0] & 0x00ff;
+  90   1          *res = *res << 8;
+  91   1          *res = *res + (dat[1] & 0x00ff);
+  92   1      }
+  93          
+  94          
+  95          /**
+  96           * Genta_New
+  97           * @brief 设置唤醒和休眠选项（四功能）
+  98           * @param dat 包含配置数据的数组
+  99           * @param offset 数据在数组中的偏移量
+ 100           * @note 数据格式:
+ 101           *       byte[offset]: 唤醒模式(0=间隔,1=整点,2=半点,3=15分钟)
+ 102           *       byte[offset+1-2]: 间隔唤醒时间(仅模式0有效)
+ 103           */
+ 104          void setWakeupSleepOptions(char *dat, char offset) {
+ 105   1          // 保存新唤醒模式
+ 106   1          WAKE_MODE = dat[offset];
+ 107   1      
+ 108   1          // 擦除原有数据
+ 109   1          IapErase(IapWakeupInterval2bAddr);
+ 110   1      
+ 111   1          // 只对间隔唤醒模式保存时间参数
+ 112   1          if(WAKE_MODE == WAKE_INTERVAL) {
+ 113   2              IapMultiWrite(IapWakeupInterval2bAddr, dat, offset, 3); // 模式+时间
+ 114   2          } else {
+ 115   2              // 其他模式只保存模式字节
+ 116   2              IapMultiWrite(IapWakeupInterval2bAddr, dat, offset, 1);
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 3   
+
+ 117   2          }
+ 118   1      
+ 119   1          // 重置上次唤醒时间
+ 120   1          LAST_WAKE_MIN = -1;
+ 121   1      }
+ 122          
+ 123          /**
+ 124           * @brief 设置工作选项
+ 125           * @param dat 包含配置数据的数组
+ 126           * @param offset 数据在数组中的偏移量
+ 127           */
+ 128          void setWorkingOptions(char *dat, char offset) {
+ 129   1          // 先擦除原有数据
+ 130   1          IapErase(IapWorkEnable2bAddr);
+ 131   1          // 写入新数据(8字节)
+ 132   1          IapMultiWrite(IapWorkEnable2bAddr, dat, offset, 8);
+ 133   1      }
+ 134          
+ 135          
+ 136          /**
+ 137           * @brief 检查水阀启动条件
+ 138           * @param now 当前时间(时间戳)
+ 139           * @param startTime 计划启动时间
+ 140           * @param duration 工作持续时间(秒)
+ 141           * @param workEnable 工作使能标志
+ 142           * @param gateStatus 当前水阀状态
+ 143           * @param countdown 工作倒计时
+ 144           * @return 检查结果:
+ 145           *         0:待机
+ 146           *         1:需要启动
+ 147           *         2:工作中
+ 148           *         3:需要停止
+ 149           */
+ 150          char GateStartChecker(long now, long startTime, int duration, char workEnable, char gateStatus, int countd
+             -own) {
+ 151   1          char res = 0;
+ 152   1      
+ 153   1          // 如果工作未使能
+ 154   1          if(workEnable == 0) {
+ 155   2              if(gateStatus == 1) {
+ 156   3                  return 3; // 如果水阀是开的，则需要关闭
+ 157   3              }
+ 158   2              return 0; // 否则保持待机
+ 159   2          }
+ 160   1      
+ 161   1          // 如果水阀正在工作
+ 162   1          if(gateStatus == 1) {
+ 163   2              if(countdown <= 0) {
+ 164   3                  return 3; // 倒计时结束则停止
+ 165   3              }
+ 166   2              return 2; // 否则保持工作状态
+ 167   2          }
+ 168   1      
+ 169   1          // 如果未到启动时间
+ 170   1          if(now < startTime) {
+ 171   2              if(gateStatus == 1) {
+ 172   3                  return 3; // 如果水阀是开的，则需要关闭
+ 173   3              }
+ 174   2              return 0; // 否则保持待机
+ 175   2          }
+ 176   1      
+ 177   1          // 如果到达启动时间窗口(60秒内)且水阀关闭
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 4   
+
+ 178   1          if(now > startTime && (now - startTime) < 60 && gateStatus == 0) {
+ 179   2              return 1; // 需要启动水阀
+ 180   2          }
+ 181   1      
+ 182   1          return res;
+ 183   1      }
+*** WARNING C280 IN LINE 150 OF romhandler.c: 'duration': unreferenced local variable
+ 184          
+ 185          
+ 186          
+ 187          /**
+ 188           * @brief 将长整型数据转换为字节数组
+ 189           * @param value 要转换的长整型值
+ 190           * @param buffer 存储结果的缓冲区
+ 191           * @param offset 缓冲区中的起始偏移
+ 192           */
+ 193          void longToByteArray(long value, char *buffer, char offset) {
+ 194   1          buffer[offset + 0] = (unsigned char)(value >> 24);  // 最高字节
+ 195   1          buffer[offset + 1] = (unsigned char)(value >> 16);
+ 196   1          buffer[offset + 2] = (unsigned char)(value >> 8);
+ 197   1          buffer[offset + 3] = (unsigned char)(value);        // 最低字节
+ 198   1      }
+ 199          
+ 200          /**
+ 201           * @brief 将字节数组转换为长整型数据
+ 202           * @param buf 源字节数组
+ 203           * @param offset 数组中的起始偏移
+ 204           * @param res 存储结果的指针
+ 205           * @return 转换后的长整型值
+ 206           */
+ 207          long byteArrayToLong(char *buf, char offset, long *res) {
+ 208   1          long tmp = 0;
+ 209   1      
+ 210   1          // 将4字节数据组合为long
+ 211   1          tmp = buf[offset + 0] & 0xff;
+ 212   1          tmp <<= 8;
+ 213   1          tmp += buf[offset + 1] & 0xff;
+ 214   1          tmp <<= 8;
+ 215   1          tmp += buf[offset + 2] & 0xff;
+ 216   1          tmp <<= 8;
+ 217   1          tmp += buf[offset + 3] & 0xff;
+ 218   1      
+ 219   1          *res = tmp; // 存储结果
+ 220   1          return tmp;
+ 221   1      }
+ 222          
+ 223          
+ 224          
+ 225          
+ 226          
+ 227          
+ 228          // int getWakeupInterval() {
+ 229          //     int res;
+ 230          //     char dat[2];
+ 231          
+ 232          //     IapReadWithSize(IapWakeupInterval2bAddr, 2, dat);
+ 233          //     res = dat[0];
+ 234          //     res = res << 8;
+ 235          //     res = res + dat[1];
+ 236          
+ 237          //     return res;
+ 238          // }
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 5   
+
+ 239          
+ 240          // int getSleepTimeout() {
+ 241          //     int res;
+ 242          //     char dat[2];
+ 243          
+ 244          //     IapReadWithSize(IapSleepTimeout2bAddr, 2, dat);
+ 245          //     res = dat[0];
+ 246          //     res = res << 8;
+ 247          //     res = res + dat[1];
+ 248          
+ 249          //     return res;
+ 250          // }
+ 251          
+ 252          // int getGateStartTime() {
+ 253          //     int res;
+ 254          //     char dat[2];
+ 255          
+ 256          //     IapReadWithSize(IapStartTime2bAddr, 2, dat);
+ 257          //     res = dat[0];
+ 258          //     res = res << 8;
+ 259          //     res = res + dat[1];
+ 260          
+ 261          //     return res;
+ 262          // }
+ 263          
+ 264          // int getGateStopTime() {
+ 265          //     int res;
+ 266          //     char dat[2];
+ 267          
+ 268          //     IapReadWithSize(IapStopTime2bAddr, 2, dat);
+ 269          //     res = dat[0];
+ 270          //     res = res << 8;
+ 271          //     res = res + dat[1];
+ 272          
+ 273          //     return res;
+ 274          // }
+ 275          
+ 276          // int getGateWorkEnable() {
+ 277          //     int res;
+ 278          //     char dat[2];
+ 279          
+ 280          //     IapReadWithSize(IapWorkEnable1bAddr, 2, dat);
+ 281          //     res = dat[0];
+ 282          //     res = res << 8;
+ 283          //     res = res + dat[1];
+ 284          
+ 285          //     return res;
+ 286          // }
+ 287          
+ 288          // void setAllOptions(char *dat, int size) {
+ 289          //     IapErase(IapSector1Addr);
+ 290          
+ 291          //     IapMultiWrite(IapSector1Addr, dat, size);
+ 292          // }
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 6   
+
+ASSEMBLY LISTING OF GENERATED OBJECT CODE
+
+
+             ; FUNCTION InitROM (BEGIN)
+                                           ; SOURCE LINE # 6
+                                           ; SOURCE LINE # 7
+0000 75C780            MOV     IAP_CONTR,#080H
+                                           ; SOURCE LINE # 8
+0003 75F50B            MOV     IAP_TPS,#0BH
+                                           ; SOURCE LINE # 9
+0006 22                RET     
+             ; FUNCTION InitROM (END)
+
+             ; FUNCTION IapIdle (BEGIN)
+                                           ; SOURCE LINE # 11
+                                           ; SOURCE LINE # 12
+0000 E4                CLR     A
+0001 F5C7              MOV     IAP_CONTR,A
+                                           ; SOURCE LINE # 13
+0003 F5C5              MOV     IAP_CMD,A
+                                           ; SOURCE LINE # 14
+0005 F5C6              MOV     IAP_TRIG,A
+                                           ; SOURCE LINE # 15
+0007 75C380            MOV     IAP_ADDRH,#080H
+                                           ; SOURCE LINE # 16
+000A F5C4              MOV     IAP_ADDRL,A
+                                           ; SOURCE LINE # 17
+000C 22                RET     
+             ; FUNCTION IapIdle (END)
+
+             ; FUNCTION _IapReadWithSize (BEGIN)
+                                           ; SOURCE LINE # 21
+0000 8E00        R     MOV     addr,R6
+0002 8F00        R     MOV     addr+01H,R7
+0004 8C00        R     MOV     size,R4
+0006 8D00        R     MOV     size+01H,R5
+0008 8B00        R     MOV     res,R3
+000A 8A00        R     MOV     res+01H,R2
+000C 8900        R     MOV     res+02H,R1
+                                           ; SOURCE LINE # 25
+000E 120000      R     LCALL   InitROM
+                                           ; SOURCE LINE # 26
+;---- Variable 'i' assigned to Register 'R4/R5' ----
+0011 E4                CLR     A
+0012 FD                MOV     R5,A
+0013 FC                MOV     R4,A
+0014         ?C0003:
+                                           ; SOURCE LINE # 27
+0014 C3                CLR     C
+0015 ED                MOV     A,R5
+0016 9500        R     SUBB    A,size+01H
+0018 E500        R     MOV     A,size
+001A 6480              XRL     A,#080H
+001C F8                MOV     R0,A
+001D EC                MOV     A,R4
+001E 6480              XRL     A,#080H
+0020 98                SUBB    A,R0
+0021 5033              JNC     ?C0004
+                                           ; SOURCE LINE # 28
+0023 E500        R     MOV     A,addr+01H
+0025 2D                ADD     A,R5
+0026 F500        R     MOV     tmpAddr+01H,A
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 7   
+
+0028 E500        R     MOV     A,addr
+002A 3C                ADDC    A,R4
+002B F500        R     MOV     tmpAddr,A
+                                           ; SOURCE LINE # 29
+002D 75C501            MOV     IAP_CMD,#01H
+                                           ; SOURCE LINE # 30
+0030 8500C4      R     MOV     IAP_ADDRL,tmpAddr+01H
+                                           ; SOURCE LINE # 31
+0033 E500        R     MOV     A,tmpAddr
+0035 FF                MOV     R7,A
+0036 8FC3              MOV     IAP_ADDRH,R7
+                                           ; SOURCE LINE # 32
+0038 75C65A            MOV     IAP_TRIG,#05AH
+                                           ; SOURCE LINE # 33
+003B 75C6A5            MOV     IAP_TRIG,#0A5H
+                                           ; SOURCE LINE # 34
+003E 00                NOP     
+                                           ; SOURCE LINE # 35
+003F 00                NOP     
+                                           ; SOURCE LINE # 36
+0040 AB00        R     MOV     R3,res
+0042 AA00        R     MOV     R2,res+01H
+0044 A900        R     MOV     R1,res+02H
+0046 8D82              MOV     DPL,R5
+0048 8C83              MOV     DPH,R4
+004A E5C2              MOV     A,IAP_DATA
+004C 120000      E     LCALL   ?C?CSTOPTR
+                                           ; SOURCE LINE # 37
+004F 0D                INC     R5
+0050 BD0001            CJNE    R5,#00H,?C0025
+0053 0C                INC     R4
+0054         ?C0025:
+                                           ; SOURCE LINE # 38
+0054 80BE              SJMP    ?C0003
+0056         ?C0004:
+                                           ; SOURCE LINE # 39
+0056 020000      R     LJMP    IapIdle
+             ; FUNCTION _IapReadWithSize (END)
+
+             ; FUNCTION _IapMultiWrite (BEGIN)
+                                           ; SOURCE LINE # 44
+0000 8E00        R     MOV     addr,R6
+0002 8F00        R     MOV     addr+01H,R7
+;---- Variable 'dat' assigned to Register 'R1/R2/R3' ----
+                                           ; SOURCE LINE # 48
+0004 120000      R     LCALL   InitROM
+                                           ; SOURCE LINE # 49
+0007 E4                CLR     A
+0008 F500        R     MOV     i,A
+000A         ?C0006:
+                                           ; SOURCE LINE # 50
+000A C3                CLR     C
+000B E500        R     MOV     A,size
+000D 6480              XRL     A,#080H
+000F F8                MOV     R0,A
+0010 E500        R     MOV     A,i
+0012 6480              XRL     A,#080H
+0014 98                SUBB    A,R0
+0015 5046              JNC     ?C0007
+                                           ; SOURCE LINE # 51
+0017 AF00        R     MOV     R7,i
+0019 EF                MOV     A,R7
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 8   
+
+001A 33                RLC     A
+001B 95E0              SUBB    A,ACC
+001D FE                MOV     R6,A
+001E E500        R     MOV     A,addr+01H
+0020 2F                ADD     A,R7
+0021 F500        R     MOV     tmpAddr+01H,A
+0023 E500        R     MOV     A,addr
+0025 3E                ADDC    A,R6
+0026 F500        R     MOV     tmpAddr,A
+                                           ; SOURCE LINE # 52
+0028 75C502            MOV     IAP_CMD,#02H
+                                           ; SOURCE LINE # 53
+002B 8500C4      R     MOV     IAP_ADDRL,tmpAddr+01H
+                                           ; SOURCE LINE # 54
+002E E500        R     MOV     A,tmpAddr
+0030 FF                MOV     R7,A
+0031 33                RLC     A
+0032 95E0              SUBB    A,ACC
+0034 8FC3              MOV     IAP_ADDRH,R7
+                                           ; SOURCE LINE # 55
+0036 AF00        R     MOV     R7,offset
+0038 EF                MOV     A,R7
+0039 33                RLC     A
+003A 95E0              SUBB    A,ACC
+003C FE                MOV     R6,A
+003D AD00        R     MOV     R5,i
+003F ED                MOV     A,R5
+0040 33                RLC     A
+0041 95E0              SUBB    A,ACC
+0043 FC                MOV     R4,A
+0044 EF                MOV     A,R7
+0045 2D                ADD     A,R5
+0046 F582              MOV     DPL,A
+0048 EE                MOV     A,R6
+0049 3C                ADDC    A,R4
+004A F583              MOV     DPH,A
+004C 120000      E     LCALL   ?C?CLDOPTR
+004F F5C2              MOV     IAP_DATA,A
+                                           ; SOURCE LINE # 56
+0051 75C65A            MOV     IAP_TRIG,#05AH
+                                           ; SOURCE LINE # 57
+0054 75C6A5            MOV     IAP_TRIG,#0A5H
+                                           ; SOURCE LINE # 58
+0057 00                NOP     
+                                           ; SOURCE LINE # 59
+0058 00                NOP     
+                                           ; SOURCE LINE # 60
+0059 0500        R     INC     i
+                                           ; SOURCE LINE # 61
+005B 80AD              SJMP    ?C0006
+005D         ?C0007:
+                                           ; SOURCE LINE # 62
+005D 020000      R     LJMP    IapIdle
+             ; FUNCTION _IapMultiWrite (END)
+
+             ; FUNCTION _IapErase (BEGIN)
+                                           ; SOURCE LINE # 65
+;---- Variable 'addr' assigned to Register 'R6/R7' ----
+                                           ; SOURCE LINE # 66
+0000 120000      R     LCALL   InitROM
+                                           ; SOURCE LINE # 67
+0003 75C503            MOV     IAP_CMD,#03H
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 9   
+
+                                           ; SOURCE LINE # 68
+0006 8FC4              MOV     IAP_ADDRL,R7
+                                           ; SOURCE LINE # 69
+0008 EE                MOV     A,R6
+0009 FF                MOV     R7,A
+000A 8FC3              MOV     IAP_ADDRH,R7
+                                           ; SOURCE LINE # 70
+000C 75C65A            MOV     IAP_TRIG,#05AH
+                                           ; SOURCE LINE # 72
+000F 75C6A5            MOV     IAP_TRIG,#0A5H
+                                           ; SOURCE LINE # 73
+0012 00                NOP     
+                                           ; SOURCE LINE # 74
+0013 020000      R     LJMP    IapIdle
+             ; FUNCTION _IapErase (END)
+
+             ; FUNCTION _IapGet2byteData (BEGIN)
+                                           ; SOURCE LINE # 82
+0000 8B00        R     MOV     res,R3
+0002 8A00        R     MOV     res+01H,R2
+0004 8900        R     MOV     res+02H,R1
+;---- Variable 'addr' assigned to Register 'R6/R7' ----
+                                           ; SOURCE LINE # 86
+0006 7B00              MOV     R3,#00H
+0008 7A00        R     MOV     R2,#HIGH dat
+000A 7900        R     MOV     R1,#LOW dat
+000C 7D02              MOV     R5,#02H
+000E 7C00              MOV     R4,#00H
+0010 120000      R     LCALL   _IapReadWithSize
+                                           ; SOURCE LINE # 89
+0013 7800        R     MOV     R0,#LOW dat
+0015 E6                MOV     A,@R0
+0016 FF                MOV     R7,A
+0017 AB00        R     MOV     R3,res
+0019 AA00        R     MOV     R2,res+01H
+001B A900        R     MOV     R1,res+02H
+001D E4                CLR     A
+001E 8FF0              MOV     B,R7
+0020 120000      E     LCALL   ?C?ISTPTR
+                                           ; SOURCE LINE # 90
+0023 AB00        R     MOV     R3,res
+0025 AA00        R     MOV     R2,res+01H
+0027 A900        R     MOV     R1,res+02H
+0029 120000      E     LCALL   ?C?ILDPTR
+002C 75F000            MOV     B,#00H
+002F 120000      E     LCALL   ?C?ISTPTR
+                                           ; SOURCE LINE # 91
+0032 08                INC     R0
+0033 E6                MOV     A,@R0
+0034 FF                MOV     R7,A
+0035 AB00        R     MOV     R3,res
+0037 AA00        R     MOV     R2,res+01H
+0039 A900        R     MOV     R1,res+02H
+003B E4                CLR     A
+003C 8FF0              MOV     B,R7
+003E 020000      E     LJMP    ?C?IILDPTR
+             ; FUNCTION _IapGet2byteData (END)
+
+             ; FUNCTION _setWakeupSleepOptions (BEGIN)
+                                           ; SOURCE LINE # 104
+0000 8B00        R     MOV     dat,R3
+0002 8A00        R     MOV     dat+01H,R2
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 10  
+
+0004 8900        R     MOV     dat+02H,R1
+0006 8D00        R     MOV     offset,R5
+                                           ; SOURCE LINE # 106
+0008 AF00        R     MOV     R7,offset
+000A EF                MOV     A,R7
+000B 33                RLC     A
+000C 95E0              SUBB    A,ACC
+000E 8F82              MOV     DPL,R7
+0010 F583              MOV     DPH,A
+0012 120000      E     LCALL   ?C?CLDOPTR
+0015 900000      E     MOV     DPTR,#WAKE_MODE
+0018 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 109
+0019 7F00              MOV     R7,#00H
+001B 7E0C              MOV     R6,#0CH
+001D 120000      R     LCALL   _IapErase
+                                           ; SOURCE LINE # 112
+0020 E0                MOVX    A,@DPTR
+0021 AB00        R     MOV     R3,dat
+0023 AA00        R     MOV     R2,dat+01H
+0025 A900        R     MOV     R1,dat+02H
+0027 7009              JNZ     ?C0011
+                                           ; SOURCE LINE # 113
+0029 850000      R     MOV     ?_IapMultiWrite?BYTE+05H,offset
+002C 750003      R     MOV     ?_IapMultiWrite?BYTE+06H,#03H
+002F FF                MOV     R7,A
+                                           ; SOURCE LINE # 114
+0030 800A              SJMP    ?C0026
+0032         ?C0011:
+                                           ; SOURCE LINE # 116
+0032 850000      R     MOV     ?_IapMultiWrite?BYTE+05H,offset
+0035 750001      R     MOV     ?_IapMultiWrite?BYTE+06H,#01H
+0038 7F00              MOV     R7,#00H
+003A 7E0C              MOV     R6,#0CH
+003C         ?C0026:
+003C 120000      R     LCALL   _IapMultiWrite
+                                           ; SOURCE LINE # 117
+003F         ?C0012:
+                                           ; SOURCE LINE # 120
+003F 900000      E     MOV     DPTR,#LAST_WAKE_MIN
+0042 74FF              MOV     A,#0FFH
+0044 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 121
+0045 22                RET     
+             ; FUNCTION _setWakeupSleepOptions (END)
+
+             ; FUNCTION _setWorkingOptions (BEGIN)
+                                           ; SOURCE LINE # 128
+;---- Variable 'offset' assigned to Register 'R5' ----
+;---- Variable 'dat' assigned to Register 'R1/R2/R3' ----
+                                           ; SOURCE LINE # 130
+0000 7F00              MOV     R7,#00H
+0002 7E0E              MOV     R6,#0EH
+0004 120000      R     LCALL   _IapErase
+                                           ; SOURCE LINE # 132
+0007 8D00        R     MOV     ?_IapMultiWrite?BYTE+05H,R5
+0009 750008      R     MOV     ?_IapMultiWrite?BYTE+06H,#08H
+000C 7F00              MOV     R7,#00H
+000E 020000      R     LJMP    _IapMultiWrite
+             ; FUNCTION _setWorkingOptions (END)
+
+             ; FUNCTION _GateStartChecker (BEGIN)
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 11  
+
+                                           ; SOURCE LINE # 150
+0000 8F00        R     MOV     now+03H,R7
+0002 8E00        R     MOV     now+02H,R6
+0004 8D00        R     MOV     now+01H,R5
+0006 8C00        R     MOV     now,R4
+                                           ; SOURCE LINE # 151
+0008 E4                CLR     A
+0009 F500        R     MOV     res,A
+                                           ; SOURCE LINE # 154
+000B E500        R     MOV     A,workEnable
+000D 700B              JNZ     ?C0015
+                                           ; SOURCE LINE # 155
+000F E500        R     MOV     A,gateStatus
+0011 B40103            CJNE    A,#01H,?C0016
+                                           ; SOURCE LINE # 156
+0014 7F03              MOV     R7,#03H
+0016 22                RET     
+                                           ; SOURCE LINE # 157
+0017         ?C0016:
+                                           ; SOURCE LINE # 158
+0017 7F00              MOV     R7,#00H
+0019 22                RET     
+                                           ; SOURCE LINE # 159
+001A         ?C0015:
+                                           ; SOURCE LINE # 162
+001A E500        R     MOV     A,gateStatus
+001C B40113            CJNE    A,#01H,?C0018
+                                           ; SOURCE LINE # 163
+001F D3                SETB    C
+0020 E500        R     MOV     A,countdown+01H
+0022 9400              SUBB    A,#00H
+0024 E500        R     MOV     A,countdown
+0026 6480              XRL     A,#080H
+0028 9480              SUBB    A,#080H
+002A 5003              JNC     ?C0019
+                                           ; SOURCE LINE # 164
+002C 7F03              MOV     R7,#03H
+002E 22                RET     
+                                           ; SOURCE LINE # 165
+002F         ?C0019:
+                                           ; SOURCE LINE # 166
+002F 7F02              MOV     R7,#02H
+0031 22                RET     
+                                           ; SOURCE LINE # 167
+0032         ?C0018:
+                                           ; SOURCE LINE # 170
+0032 AF00        R     MOV     R7,startTime+03H
+0034 AE00        R     MOV     R6,startTime+02H
+0036 AD00        R     MOV     R5,startTime+01H
+0038 AC00        R     MOV     R4,startTime
+003A AB00        R     MOV     R3,now+03H
+003C AA00        R     MOV     R2,now+02H
+003E A900        R     MOV     R1,now+01H
+0040 A800        R     MOV     R0,now
+0042 C3                CLR     C
+0043 120000      E     LCALL   ?C?SLCMP
+0046 500B              JNC     ?C0020
+                                           ; SOURCE LINE # 171
+0048 E500        R     MOV     A,gateStatus
+004A B40103            CJNE    A,#01H,?C0021
+                                           ; SOURCE LINE # 172
+004D 7F03              MOV     R7,#03H
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 12  
+
+004F 22                RET     
+                                           ; SOURCE LINE # 173
+0050         ?C0021:
+                                           ; SOURCE LINE # 174
+0050 7F00              MOV     R7,#00H
+0052 22                RET     
+                                           ; SOURCE LINE # 175
+0053         ?C0020:
+                                           ; SOURCE LINE # 178
+0053 AF00        R     MOV     R7,startTime+03H
+0055 AE00        R     MOV     R6,startTime+02H
+0057 AD00        R     MOV     R5,startTime+01H
+0059 AC00        R     MOV     R4,startTime
+005B AB00        R     MOV     R3,now+03H
+005D AA00        R     MOV     R2,now+02H
+005F A900        R     MOV     R1,now+01H
+0061 A800        R     MOV     R0,now
+0063 D3                SETB    C
+0064 120000      E     LCALL   ?C?SLCMP
+0067 4027              JC      ?C0022
+0069 E500        R     MOV     A,now+03H
+006B 9500        R     SUBB    A,startTime+03H
+006D FF                MOV     R7,A
+006E E500        R     MOV     A,now+02H
+0070 9500        R     SUBB    A,startTime+02H
+0072 FE                MOV     R6,A
+0073 E500        R     MOV     A,now+01H
+0075 9500        R     SUBB    A,startTime+01H
+0077 FD                MOV     R5,A
+0078 E500        R     MOV     A,now
+007A 9500        R     SUBB    A,startTime
+007C FC                MOV     R4,A
+007D E4                CLR     A
+007E 7B3C              MOV     R3,#03CH
+0080 FA                MOV     R2,A
+0081 F9                MOV     R1,A
+0082 F8                MOV     R0,A
+0083 D3                SETB    C
+0084 120000      E     LCALL   ?C?SLCMP
+0087 4007              JC      ?C0022
+0089 E500        R     MOV     A,gateStatus
+008B 7003              JNZ     ?C0022
+                                           ; SOURCE LINE # 179
+008D 7F01              MOV     R7,#01H
+008F 22                RET     
+                                           ; SOURCE LINE # 180
+0090         ?C0022:
+                                           ; SOURCE LINE # 182
+0090 AF00        R     MOV     R7,res
+                                           ; SOURCE LINE # 183
+0092         ?C0017:
+0092 22                RET     
+             ; FUNCTION _GateStartChecker (END)
+
+             ; FUNCTION _longToByteArray (BEGIN)
+                                           ; SOURCE LINE # 193
+0000 8F00        R     MOV     value+03H,R7
+0002 8E00        R     MOV     value+02H,R6
+0004 8D00        R     MOV     value+01H,R5
+0006 8C00        R     MOV     value,R4
+0008 8B00        R     MOV     buffer,R3
+000A 8A00        R     MOV     buffer+01H,R2
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 13  
+
+000C 8900        R     MOV     buffer+02H,R1
+                                           ; SOURCE LINE # 194
+000E 7818              MOV     R0,#018H
+0010 120000      E     LCALL   ?C?SLSHR
+0013 E500        R     MOV     A,offset
+0015 FD                MOV     R5,A
+0016 33                RLC     A
+0017 95E0              SUBB    A,ACC
+0019 8D82              MOV     DPL,R5
+001B F583              MOV     DPH,A
+001D EF                MOV     A,R7
+001E 120000      E     LCALL   ?C?CSTOPTR
+                                           ; SOURCE LINE # 195
+0021 AF00        R     MOV     R7,value+03H
+0023 AE00        R     MOV     R6,value+02H
+0025 AD00        R     MOV     R5,value+01H
+0027 AC00        R     MOV     R4,value
+0029 7810              MOV     R0,#010H
+002B 120000      E     LCALL   ?C?SLSHR
+002E E500        R     MOV     A,offset
+0030 FD                MOV     R5,A
+0031 33                RLC     A
+0032 95E0              SUBB    A,ACC
+0034 8D82              MOV     DPL,R5
+0036 F583              MOV     DPH,A
+0038 A3                INC     DPTR
+0039 EF                MOV     A,R7
+003A 120000      E     LCALL   ?C?CSTOPTR
+                                           ; SOURCE LINE # 196
+003D AF00        R     MOV     R7,value+03H
+003F AE00        R     MOV     R6,value+02H
+0041 AD00        R     MOV     R5,value+01H
+0043 AC00        R     MOV     R4,value
+0045 7808              MOV     R0,#08H
+0047 120000      E     LCALL   ?C?SLSHR
+004A E500        R     MOV     A,offset
+004C FD                MOV     R5,A
+004D 33                RLC     A
+004E 95E0              SUBB    A,ACC
+0050 8D82              MOV     DPL,R5
+0052 F583              MOV     DPH,A
+0054 A3                INC     DPTR
+0055 A3                INC     DPTR
+0056 EF                MOV     A,R7
+0057 120000      E     LCALL   ?C?CSTOPTR
+                                           ; SOURCE LINE # 197
+005A E500        R     MOV     A,offset
+005C FD                MOV     R5,A
+005D 33                RLC     A
+005E 95E0              SUBB    A,ACC
+0060 8D82              MOV     DPL,R5
+0062 F583              MOV     DPH,A
+0064 A3                INC     DPTR
+0065 A3                INC     DPTR
+0066 A3                INC     DPTR
+0067 E500        R     MOV     A,value+03H
+0069 020000      E     LJMP    ?C?CSTOPTR
+             ; FUNCTION _longToByteArray (END)
+
+             ; FUNCTION _byteArrayToLong (BEGIN)
+                                           ; SOURCE LINE # 207
+0000 8B00        R     MOV     buf,R3
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 14  
+
+0002 8A00        R     MOV     buf+01H,R2
+0004 8900        R     MOV     buf+02H,R1
+0006 8D00        R     MOV     offset,R5
+                                           ; SOURCE LINE # 208
+0008 E4                CLR     A
+0009 F500        R     MOV     tmp+03H,A
+000B F500        R     MOV     tmp+02H,A
+000D F500        R     MOV     tmp+01H,A
+000F F500        R     MOV     tmp,A
+                                           ; SOURCE LINE # 211
+0011 AF00        R     MOV     R7,offset
+0013 EF                MOV     A,R7
+0014 33                RLC     A
+0015 95E0              SUBB    A,ACC
+0017 FE                MOV     R6,A
+0018 E9                MOV     A,R1
+0019 2F                ADD     A,R7
+001A F9                MOV     R1,A
+001B EA                MOV     A,R2
+001C 3E                ADDC    A,R6
+001D 8982              MOV     DPL,R1
+001F F583              MOV     DPH,A
+0021 120000      E     LCALL   ?C?CLDOPTR
+0024 FF                MOV     R7,A
+0025 E4                CLR     A
+0026 8F00        R     MOV     tmp+03H,R7
+0028 F500        R     MOV     tmp+02H,A
+002A F500        R     MOV     tmp+01H,A
+002C F500        R     MOV     tmp,A
+                                           ; SOURCE LINE # 212
+002E AE00        R     MOV     R6,tmp+02H
+0030 AD00        R     MOV     R5,tmp+01H
+0032 AC00        R     MOV     R4,tmp
+0034 7808              MOV     R0,#08H
+0036 120000      E     LCALL   ?C?LSHL
+0039 8F00        R     MOV     tmp+03H,R7
+003B 8E00        R     MOV     tmp+02H,R6
+003D 8D00        R     MOV     tmp+01H,R5
+003F 8C00        R     MOV     tmp,R4
+                                           ; SOURCE LINE # 213
+0041 AF00        R     MOV     R7,offset
+0043 EF                MOV     A,R7
+0044 33                RLC     A
+0045 95E0              SUBB    A,ACC
+0047 FE                MOV     R6,A
+0048 EF                MOV     A,R7
+0049 2401              ADD     A,#01H
+004B FF                MOV     R7,A
+004C E4                CLR     A
+004D 3E                ADDC    A,R6
+004E FE                MOV     R6,A
+004F E500        R     MOV     A,buf+02H
+0051 2F                ADD     A,R7
+0052 F9                MOV     R1,A
+0053 EA                MOV     A,R2
+0054 3E                ADDC    A,R6
+0055 8982              MOV     DPL,R1
+0057 F583              MOV     DPH,A
+0059 120000      E     LCALL   ?C?CLDOPTR
+005C FF                MOV     R7,A
+005D E4                CLR     A
+005E FC                MOV     R4,A
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 15  
+
+005F FD                MOV     R5,A
+0060 FE                MOV     R6,A
+0061 E500        R     MOV     A,tmp+03H
+0063 2F                ADD     A,R7
+0064 F500        R     MOV     tmp+03H,A
+0066 EE                MOV     A,R6
+0067 3500        R     ADDC    A,tmp+02H
+0069 F500        R     MOV     tmp+02H,A
+006B ED                MOV     A,R5
+006C 3500        R     ADDC    A,tmp+01H
+006E F500        R     MOV     tmp+01H,A
+0070 EC                MOV     A,R4
+0071 3500        R     ADDC    A,tmp
+0073 F500        R     MOV     tmp,A
+                                           ; SOURCE LINE # 214
+0075 AF00        R     MOV     R7,tmp+03H
+0077 AE00        R     MOV     R6,tmp+02H
+0079 AD00        R     MOV     R5,tmp+01H
+007B FC                MOV     R4,A
+007C 7808              MOV     R0,#08H
+007E 120000      E     LCALL   ?C?LSHL
+0081 8F00        R     MOV     tmp+03H,R7
+0083 8E00        R     MOV     tmp+02H,R6
+0085 8D00        R     MOV     tmp+01H,R5
+0087 8C00        R     MOV     tmp,R4
+                                           ; SOURCE LINE # 215
+0089 AF00        R     MOV     R7,offset
+008B EF                MOV     A,R7
+008C 33                RLC     A
+008D 95E0              SUBB    A,ACC
+008F FE                MOV     R6,A
+0090 EF                MOV     A,R7
+0091 2402              ADD     A,#02H
+0093 FF                MOV     R7,A
+0094 E4                CLR     A
+0095 3E                ADDC    A,R6
+0096 FE                MOV     R6,A
+0097 E500        R     MOV     A,buf+02H
+0099 2F                ADD     A,R7
+009A F9                MOV     R1,A
+009B EA                MOV     A,R2
+009C 3E                ADDC    A,R6
+009D 8982              MOV     DPL,R1
+009F F583              MOV     DPH,A
+00A1 120000      E     LCALL   ?C?CLDOPTR
+00A4 FF                MOV     R7,A
+00A5 E4                CLR     A
+00A6 FC                MOV     R4,A
+00A7 FD                MOV     R5,A
+00A8 FE                MOV     R6,A
+00A9 E500        R     MOV     A,tmp+03H
+00AB 2F                ADD     A,R7
+00AC F500        R     MOV     tmp+03H,A
+00AE EE                MOV     A,R6
+00AF 3500        R     ADDC    A,tmp+02H
+00B1 F500        R     MOV     tmp+02H,A
+00B3 ED                MOV     A,R5
+00B4 3500        R     ADDC    A,tmp+01H
+00B6 F500        R     MOV     tmp+01H,A
+00B8 EC                MOV     A,R4
+00B9 3500        R     ADDC    A,tmp
+00BB F500        R     MOV     tmp,A
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 16  
+
+                                           ; SOURCE LINE # 216
+00BD AF00        R     MOV     R7,tmp+03H
+00BF AE00        R     MOV     R6,tmp+02H
+00C1 AD00        R     MOV     R5,tmp+01H
+00C3 FC                MOV     R4,A
+00C4 7808              MOV     R0,#08H
+00C6 120000      E     LCALL   ?C?LSHL
+00C9 8F00        R     MOV     tmp+03H,R7
+00CB 8E00        R     MOV     tmp+02H,R6
+00CD 8D00        R     MOV     tmp+01H,R5
+00CF 8C00        R     MOV     tmp,R4
+                                           ; SOURCE LINE # 217
+00D1 AF00        R     MOV     R7,offset
+00D3 EF                MOV     A,R7
+00D4 33                RLC     A
+00D5 95E0              SUBB    A,ACC
+00D7 FE                MOV     R6,A
+00D8 EF                MOV     A,R7
+00D9 2403              ADD     A,#03H
+00DB FF                MOV     R7,A
+00DC E4                CLR     A
+00DD 3E                ADDC    A,R6
+00DE FE                MOV     R6,A
+00DF E500        R     MOV     A,buf+02H
+00E1 2F                ADD     A,R7
+00E2 F9                MOV     R1,A
+00E3 EA                MOV     A,R2
+00E4 3E                ADDC    A,R6
+00E5 8982              MOV     DPL,R1
+00E7 F583              MOV     DPH,A
+00E9 120000      E     LCALL   ?C?CLDOPTR
+00EC FF                MOV     R7,A
+00ED E4                CLR     A
+00EE FC                MOV     R4,A
+00EF FD                MOV     R5,A
+00F0 FE                MOV     R6,A
+00F1 E500        R     MOV     A,tmp+03H
+00F3 2F                ADD     A,R7
+00F4 F500        R     MOV     tmp+03H,A
+00F6 EE                MOV     A,R6
+00F7 3500        R     ADDC    A,tmp+02H
+00F9 F500        R     MOV     tmp+02H,A
+00FB ED                MOV     A,R5
+00FC 3500        R     ADDC    A,tmp+01H
+00FE F500        R     MOV     tmp+01H,A
+0100 EC                MOV     A,R4
+0101 3500        R     ADDC    A,tmp
+0103 F500        R     MOV     tmp,A
+                                           ; SOURCE LINE # 219
+0105 AF00        R     MOV     R7,tmp+03H
+0107 AE00        R     MOV     R6,tmp+02H
+0109 AD00        R     MOV     R5,tmp+01H
+010B FC                MOV     R4,A
+010C AB00        R     MOV     R3,res
+010E AA00        R     MOV     R2,res+01H
+0110 A900        R     MOV     R1,res+02H
+0112 120000      E     LCALL   ?C?LSTPTR
+                                           ; SOURCE LINE # 220
+0115 AF00        R     MOV     R7,tmp+03H
+0117 AE00        R     MOV     R6,tmp+02H
+0119 AD00        R     MOV     R5,tmp+01H
+011B AC00        R     MOV     R4,tmp
+C51 COMPILER V9.54   ROMHANDLER                                                            05/07/2025 14:49:15 PAGE 17  
+
+                                           ; SOURCE LINE # 221
+011D         ?C0024:
+011D 22                RET     
+             ; FUNCTION _byteArrayToLong (END)
+
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =    920    ----
+   CONSTANT SIZE    =   ----    ----
+   XDATA SIZE       =   ----    ----
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =   ----      62
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =   ----    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  1 WARNING(S),  0 ERROR(S)

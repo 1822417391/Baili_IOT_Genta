@@ -1,0 +1,4002 @@
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 1   
+
+
+C51 COMPILER V9.54, COMPILATION OF MODULE MAIN
+OBJECT MODULE PLACED IN .\Objects\main.obj
+COMPILER INVOKED BY: D:\Keil\C51\BIN\C51.EXE main.c OPTIMIZE(8,SPEED) BROWSE DEBUG OBJECTEXTEND CODE PRINT(.\Listings\ma
+                    -in.lst) OBJECT(.\Objects\main.obj)
+
+line level    source
+
+   1          // main.c
+   2          
+   3          #include <stc8h.h>
+   4          #include <intrins.h>
+   5          #include <math.h>
+   6          #include <stdio.h>
+   7          #include <stdlib.h>
+   8          #include <string.h>
+   9          #include "stdint.h"
+  10          #include "common.h"
+  11          #include "romhandler.h"
+  12          // #include "RTCController.h"
+  13          #include "crc.h"
+  14          
+  15          #define RVREADTIMEOUT           20
+  16          #define CRCOUNT                         2
+  17          #define ReadFailedLimit         3
+  18          
+  19          
+  20          
+  21          sbit LED = P1^2;
+  22          // Uart1 defines
+  23          #define BRT (65536 - MAIN_Fosc / 9600 / 4)
+  24          
+  25          
+  26          // void delay_ms(unsigned int ms)
+  27          // {
+  28          //    unsigned int i;
+  29          //    do
+  30          //    {
+  31          //        i = MAIN_Fosc / 13000;
+  32          //        while (--i)
+  33          //            ; // 14T per loop
+  34          //    } while (--ms);
+  35          // }
+  36          
+  37          /********************************INIT Setting***********************************/
+  38          // 定时器计数器
+  39          char T1COUNTER = 0;
+  40          unsigned char T1MSGCOUNTER = 0;
+  41          
+  42          // 系统状态标志
+  43          char xdata FIRST_INIT;          // 首次初始化标志
+  44          unsigned int VOLTAGE_NUM;       // 电压数值
+  45          unsigned int CALCULATE_COUNT;   // 计算计数器
+  46          char LOW_POWER_MODE;            // 低功耗模式标志
+  47          
+  48          // 超时计数器
+  49          int SCCOUNTER;     // 休眠计数器
+  50          int SCTIMEOUT;     // 休眠超时
+  51          int WKTIMEOUT;     // 唤醒超时
+  52          int WKCOUNTER;     // 唤醒计数器
+  53          
+  54          // 通信协议数据包
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 2   
+
+  55          char xdata BATRESP[9] = {0x29, 0x29, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0D};
+  56          char xdata SLEEPRESP[8] = {0x29, 0x29, 0x04, 0x00, 0x00, 0x30, 0x5B, 0x0D};
+  57          
+  58          //手动模式数据包
+  59          char xdata manual_resp[9] = {0x29, 0x29, 0x0B, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0D};
+  60          
+  61          // 其他系统变量
+  62          char sendingFlag2 = 0;          // 发送标志
+  63          int *F32K;                      // 32K时钟指针
+  64          int xdata WAKEUPTIMERCOUNT;     // 唤醒定时器计数
+  65          char RTC_INT_Flag;              // RTC中断标志
+  66          char xdata DAYS[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}; // 每月天数
+  67          unsigned long xdata DATETIME;   // 系统时间
+  68          char xdata HARTBEATMSG[26];     // 心跳消息
+  69          int xdata TMPSCTIMEOUT;         // 临时休眠超时
+  70          int xdata TMPWKTIMEOUT;         // 临时唤醒超时
+  71          char xdata TMPWKTCH;            // 唤醒定时器高字节
+  72          char xdata TMPWKTCL;            // 唤醒定时器低字节
+  73          
+  74          // 在INIT Setting区域添加变量
+  75          extern char xdata WAKE_MODE = WAKE_INTERVAL;  // 当前唤醒模式
+  76          extern char xdata LAST_WAKE_MIN = -1;         // 上次唤醒的分钟数
+  77          
+  78          // 新增手动模式标志位 RTC_V1.1.0
+  79          char xdata MANUAL_MODE_ENABLED = 0;  // 手动模式状态 0-关闭 1-开启
+  80          
+  81          /*(Genta New) 唤醒指令实例
+  82           *  间隔唤醒(现有功能)
+  83              29 29 07 00 03 00 02 58 [CRC] 0D            29 29 07 00 03 00 02 58 3B D2 0D
+  84              - 模式: 0x00(间隔)
+  85              - 时间: 0x0258(600秒=10分钟)
+  86           *
+  87           *  整点唤醒(新增)
+  88              29 29 07 00 01 01 [CRC] 0D                  29 29 07 00 01 01 9B 00 0D
+  89              - 模式: 0x01(整点)
+  90           *
+  91           *  半点唤醒(新增)
+  92              29 29 07 00 01 02 [CRC] 0D                  29 29 07 00 01 02 DB 01 0D
+  93              - 模式: 0x02(半点)
+  94           *
+  95           *  每15分钟唤醒(新增)
+  96              29 29 07 00 01 03 [CRC] 0D                  29 29 07 00 01 03 1A C1 0D
+  97              - 模式: 0x03(15分钟)
+  98          */
+  99          
+ 100          /*=============== RTC_V1.1.0代码修改说明 ================
+ 101          1. 新增手动控制模式标志位及相关处理逻辑
+ 102          2. 在UART协议中新增两个指令：
+ 103             - 开启手动模式：0x29 0x29 0x0B [数据长度] [CRC] 0x0D
+ 104             - 关闭手动模式：0x29 0x29 0x0C [数据长度] [CRC] 0x0D
+ 105          3. 修改定时任务和低功耗逻辑，确保手动模式优先级
+ 106          ===========================================*/
+ 107          
+ 108          /********************************INIT Setting***********************************/
+ 109          
+ 110          /********************************188 Setting***********************************/
+ 111          unsigned int DISPLAY_NUM;
+ 112          //char DISPLAY_STATUS;
+ 113          /********************************188 Setting***********************************/
+ 114          
+ 115          
+ 116          /********************************Gate Setting***********************************/
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 3   
+
+ 117          
+ 118          // 水阀状态变量
+ 119          unsigned long xdata GATE_START_TIME;  // 水阀开始时间
+ 120          int xdata GATE_WORK_DURATION;         // 水阀工作持续时间
+ 121          int xdata GATE_WORK_ENABLE;           // 水阀工作使能
+ 122          char xdata GATE_ACTIVATING;           // 水阀激活标志
+ 123          char xdata GATE_STATUS = -1;          // 水阀状态(-1:未知, 0:关闭, 1:打开)
+ 124          int xdata GATE_WORK_COUNTDOWN = 0;    // 水阀工作倒计时
+ 125          
+ 126          // 关闭水阀函数
+ 127          void OPENGATE() {
+ 128   1          if(P13 == 0 && P14 == 0) {  // 确保水阀引脚当前处于非激活状态
+ 129   2              // 设置10秒后复位水阀引脚
+ 130   2              GATE_ACTIVATING = T1COUNTER + 10 > 20 ? (T1COUNTER + 10) - 20 : T1COUNTER + 10;
+ 131   2              P13 = 1;  // 设置P1.3高电平
+ 132   2              P14 = 0;  // 设置P1.4低电平
+ 133   2              GATE_STATUS = 1;  // 更新水阀状态为打开
+ 134   2          }
+ 135   1      }
+ 136          
+ 137          // 关闭水阀函数
+ 138          void CLOSEGATE() {
+ 139   1          if(P13 == 0 && P14 == 0) {  // 确保水阀引脚当前处于非激活状态
+ 140   2              // 设置10秒后复位水阀引脚
+ 141   2              GATE_ACTIVATING = T1COUNTER + 10 > 20 ? (T1COUNTER + 10) - 20 : T1COUNTER + 10;
+ 142   2              P13 = 0;  // 设置P1.3低电平
+ 143   2              P14 = 1;  // 设置P1.4高电平
+ 144   2              GATE_STATUS = 0;  // 更新水阀状态为关闭
+ 145   2          }
+ 146   1      }
+ 147          
+ 148          // 复位水阀引脚
+ 149          void RESETGATE() {
+ 150   1          P13 = 0;  // 复位P1.3
+ 151   1          P14 = 0;  // 复位P1.4
+ 152   1      }
+ 153          
+ 154          // 水阀启动检查器
+ 155          char doGateStartChecker(char early) {
+ 156   1          return GateStartChecker(DATETIME, GATE_START_TIME - early,
+ 157   1                                GATE_WORK_DURATION, GATE_WORK_ENABLE,
+ 158   1                                GATE_STATUS, GATE_WORK_COUNTDOWN);
+ 159   1      }
+ 160          /********************************Gate Setting***********************************/
+ 161          
+ 162          
+ 163          /********************************FILP LED***********************************/
+ 164          // void FilpLED() {
+ 165          //      if(LOW_POWER_MODE == 1 || LOW_POWER_MODE == 2){
+ 166          //              LED = 1;
+ 167          //      }
+ 168          //      if (LED)
+ 169          //      {
+ 170          //              LED = 0;
+ 171          //      }
+ 172          //      else
+ 173          //      {
+ 174          //              LED = 1;
+ 175          //      }
+ 176          // }
+ 177          /********************************FILP LED***********************************/
+ 178          void GetWakeupTimerCount() {
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 4   
+
+ 179   1          unsigned int tmpf32k;
+ 180   1      
+ 181   1          tmpf32k = *F32K & 0xffff;  // 读取32K时钟值
+ 182   1          WAKEUPTIMERCOUNT = ((35675 * 10) / 16) - 1;  // 计算唤醒定时器计数值
+ 183   1      
+ 184   1          // 设置唤醒定时器低字节和高字节
+ 185   1          TMPWKTCL = WAKEUPTIMERCOUNT & 0x00ff;
+ 186   1          TMPWKTCH = 0;
+ 187   1          TMPWKTCH += (WAKEUPTIMERCOUNT >> 8) & 0x00ff;
+ 188   1          TMPWKTCH += 0x80;  // 设置唤醒定时器使能位
+ 189   1      }
+ 190          
+ 191          void ReadBat() {
+ 192   1          unsigned int crc;
+ 193   1          BATRESP[5] = DISPLAY_NUM;  // 设置电池电量值
+ 194   1      
+ 195   1          // 计算CRC校验
+ 196   1          crc = MODBUS_CRC16(BATRESP, 6);
+ 197   1          BATRESP[6] = crc & 0x00ff;       // CRC低字节
+ 198   1          BATRESP[7] = (crc >> 8) & 0x00ff; // CRC高字节
+ 199   1      
+ 200   1          sendingFlag2 = 1;  // 设置发送标志
+ 201   1      }
+ 202          
+ 203          void LoadConfig() {
+ 204   1          char tmpDatetime[4];
+ 205   1      
+ 206   1          // 从ROM读取水阀工作使能设置
+ 207   1          IapGet2byteData(IapWorkEnable2bAddr, &GATE_WORK_ENABLE);
+ 208   1      
+ 209   1          // 读取水阀开始时间
+ 210   1          IapReadWithSize(IapStartDateTime4bAddr, 4, tmpDatetime);
+ 211   1          GATE_START_TIME = tmpDatetime[0] & 0xff;
+ 212   1          GATE_START_TIME <<= 8;
+ 213   1          GATE_START_TIME += tmpDatetime[1] & 0xff;
+ 214   1          GATE_START_TIME <<= 8;
+ 215   1          GATE_START_TIME += tmpDatetime[2] & 0xff;
+ 216   1          GATE_START_TIME <<= 8;
+ 217   1          GATE_START_TIME += tmpDatetime[3] & 0xff;
+ 218   1      
+ 219   1          // 读取水阀工作持续时间
+ 220   1          IapGet2byteData(IapWorkDuration2bAddr, &GATE_WORK_DURATION);
+ 221   1      
+ 222   1          // 读取休眠和唤醒超时设置
+ 223   1          IapGet2byteData(IapSleepTimeout2bAddr, &TMPSCTIMEOUT);
+ 224   1          IapGet2byteData(IapWakeupInterval2bAddr, &TMPWKTIMEOUT);
+ 225   1      
+ 226   1          // 计算实际超时值
+ 227   1          if(TMPSCTIMEOUT >= 60) {
+ 228   2              SCTIMEOUT = (TMPSCTIMEOUT * 100) / 6;
+ 229   2          }
+ 230   1          if(TMPWKTIMEOUT >= 60) {
+ 231   2              WKTIMEOUT = TMPWKTIMEOUT / 10;
+ 232   2          }
+ 233   1      
+ 234   1          // 重置计数器
+ 235   1          SCCOUNTER = 0;
+ 236   1          WKCOUNTER = 0;
+ 237   1      }
+ 238          /********************************UART1 Setting***********************************/
+ 239          //char busy1;
+ 240          //char wptr1;
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 5   
+
+ 241          //char xdata buffer1[16];
+ 242          //char sendingFlag1 = 0;
+ 243          //char headok = 0;
+ 244          
+ 245          //void Uart1Isr() interrupt 4
+ 246          //{
+ 247          //      if (TI)
+ 248          //      {
+ 249          //              TI = 0;
+ 250          //              busy1 = 0;
+ 251          //      }
+ 252          //      if (RI)
+ 253          //      {
+ 254          //              RI = 0;
+ 255          ////            buffer1[wptr1++] = SBUF;
+ 256          ////            wptr1 &= 0x0f;
+ 257          //
+ 258          //              buffer1[wptr1] = SBUF;
+ 259          //              if(wptr1 == 0){
+ 260          //                      if(buffer1[wptr1] != 0x29){
+ 261          //                              wptr1 = 0;
+ 262          //                              return;
+ 263          //                      }
+ 264          //              }
+ 265          //              else if(wptr1 == 1 && buffer1[wptr1] == 0x29 && buffer1[wptr1 - 1 ] == 0x29) {
+ 266          //                      headok = 1;
+ 267          //              }
+ 268          //              else if(headok == 1 && wptr1 < 7) {
+ 269          //                      //readbyte ++;
+ 270          //                      if(wptr1 == 6 && buffer1[wptr1] == 0x0D) {
+ 271          //                              if(FIRST_INIT == 0 ){
+ 272          //                                      FIRST_INIT = 1;
+ 273          //                                      CALCULATE_COUNT = 0;
+ 274          //                              }
+ 275          //                              ReadBat(buffer1, 7);
+ 276          //                              wptr1 = 0;
+ 277          //                              headok = 0;
+ 278          //                              return;
+ 279          //                      }
+ 280          //              }
+ 281          //              else {
+ 282          //                      if(wptr1 == 7) {
+ 283          //                              ReadBat(buffer1, 8);
+ 284          //                      }
+ 285          //                      wptr1 = 0;
+ 286          //                      headok = 0;
+ 287          //                      return;
+ 288          //              }
+ 289          //              wptr1++;
+ 290          //              wptr1 &= 0x0f;
+ 291          //              SCCOUNTER = 0;
+ 292          //              LOW_POWER_MODE = 0;
+ 293          //      }
+ 294          //}
+ 295          //void Uart1Init()
+ 296          //{
+ 297          //    SCON = 0x50 ;
+ 298          //    T2L = BRT;
+ 299          //    T2H = BRT >> 8;
+ 300          //    wptr1 = 0x00;
+ 301          //    busy1 = 0;
+ 302          //    ES = 1;
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 6   
+
+ 303          //    EA = 1;
+ 304          //}
+ 305          //void Uart1Send(char dat)
+ 306          //{
+ 307          //    while (busy1);
+ 308          //    busy1 = 1;
+ 309          //    SBUF = dat;
+ 310          //}
+ 311          //void Uart1SendStr(char *p, unsigned char size)
+ 312          //{
+ 313          //      unsigned char i = 0;
+ 314          //    while (i < size)
+ 315          //    {
+ 316          //        Uart1Send(p[i]);
+ 317          //              i++;
+ 318          //    }
+ 319          //}
+ 320          /********************************UART1 Setting***********************************/
+ 321          
+ 322          /********************************UART2 Setting***********************************/
+ 323          // UART2状态变量
+ 324          char busy2;                  // 发送忙标志
+ 325          char wptr2;                  // 写指针
+ 326          char xdata buffer2[16] = {0}; // 接收缓冲区
+ 327          char headok = 0;             // 头校验通过标志
+ 328          unsigned int xdata crcData;  // CRC数据
+ 329          unsigned int xdata crcRes;   // CRC结果
+ 330          
+ 331          // UART2中断服务程序
+ 332          void Uart2Isr() interrupt 8 {
+ 333   1          if (S2CON & 0x02) {  // 发送完成中断
+ 334   2              S2CON &= ~0x02;
+ 335   2              busy2 = 0;
+ 336   2          }
+ 337   1          if (S2CON & 0x01) {  // 接收中断
+ 338   2              S2CON &= ~0x01;
+ 339   2      
+ 340   2              // 重置休眠计数器
+ 341   2              SCCOUNTER = 0;
+ 342   2              LOW_POWER_MODE = 0;
+ 343   2      
+ 344   2              // 存储接收到的数据
+ 345   2              buffer2[wptr2] = S2BUF;
+ 346   2      
+ 347   2              // 协议解析
+ 348   2              if(wptr2 == 0) {  // 检查第一个字节
+ 349   3                  if(buffer2[wptr2] != 0x29) {  // 不是协议头
+ 350   4                      wptr2 = 0;
+ 351   4                      return;
+ 352   4                  }
+ 353   3              }
+ 354   2              else if(wptr2 == 1 && buffer2[wptr2] == 0x29 && buffer2[wptr2 - 1] == 0x29) {
+ 355   3                  headok = 1;  // 协议头校验通过
+ 356   3              }
+ 357   2              else if(headok == 1 && wptr2 < 16) {
+ 358   3                  if(buffer2[wptr2] == 0x0D) {  // 收到结束标志
+ 359   4                      // 计算CRC校验
+ 360   4                      crcData = 0;
+ 361   4                      crcData += buffer2[wptr2 - 1] & 0xff;
+ 362   4                      crcData = crcData << 8;
+ 363   4                      crcData += buffer2[wptr2 - 2] & 0xff;
+ 364   4                      crcRes = MODBUS_CRC16(buffer2, wptr2 - 2);
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 7   
+
+ 365   4      
+ 366   4                      if(crcData == crcRes) {  // CRC校验通过
+ 367   5                          switch(buffer2[2]) {  // 根据指令类型处理
+ 368   6                              case 1: {  // 查询电池电量
+ 369   7                                  if(FIRST_INIT == 0) {
+ 370   8                                      FIRST_INIT = 1;
+ 371   8                                      CALCULATE_COUNT = 0;
+ 372   8                                  }
+ 373   7                                  ReadBat();
+ 374   7                              } break;
+ 375   6      
+ 376   6                              case 4: {  // 进入低功耗模式
+ 377   7                                  SCCOUNTER = SCTIMEOUT - 100;
+ 378   7                                  sendingFlag2 = 2;
+ 379   7                              } break;
+ 380   6      
+ 381   6                              case 5: {  // 门控控制
+ 382   7                                  if(buffer2[5] == 0x01) {
+ 383   8                                      OPENGATE();
+ 384   8                                  }
+ 385   7                                  else if(buffer2[5] == 0x02) {
+ 386   8                                      CLOSEGATE();
+ 387   8                                  }
+ 388   7                              } break;
+ 389   6      
+ 390   6                              case 6: {  // 设置时钟
+ 391   7                                  DATETIME = buffer2[5] & 0xff;
+ 392   7                                  DATETIME <<= 8;
+ 393   7                                  DATETIME += buffer2[6] & 0xff;
+ 394   7                                  DATETIME <<= 8;
+ 395   7                                  DATETIME += buffer2[7] & 0xff;
+ 396   7                                  DATETIME <<= 8;
+ 397   7                                  DATETIME += buffer2[8] & 0xff;
+ 398   7                                  sendingFlag2 = 3;
+ 399   7                              } break;
+ 400   6      
+ 401   6                              case 7: {  // 设置唤醒和休眠选项
+ 402   7                                  // 指令格式: 0x29 0x29 0x07 [LEN_H] [LEN_L] [MODE] [TIME_H] [TIME_L] [CRC]
+             - 0x0D
+ 403   7                                  // MODE: 0=间隔,1=整点,2=半点,3=15分钟
+ 404   7                                  // TIME: 仅MODE=0时有效(间隔秒数)
+ 405   7                                  setWakeupSleepOptions(buffer2, 5);  //擦除烧写
+ 406   7                                  LoadConfig();
+ 407   7                                  sendingFlag2 = 3;
+ 408   7                              } break;
+ 409   6      
+ 410   6                              case 8: {  // 设置工作选项
+ 411   7                                  setWorkingOptions(buffer2, 5);  //擦除烧写
+ 412   7                                  LoadConfig();
+ 413   7                                  sendingFlag2 = 3;
+ 414   7                              } break;
+ 415   6      
+ 416   6                              /* 新增手动模式控制指令 */
+ 417   6                              case 0x0B:{     // 开启手动模式
+ 418   7                                  MANUAL_MODE_ENABLED = 1;
+ 419   7                                  SCCOUNTER = 0;  // 重置休眠计数器
+ 420   7                                  LOW_POWER_MODE = 0; // 退出低功耗
+ 421   7                                  sendingFlag2 = 4; // 设置手动模式响应标志
+ 422   7                              } break;
+ 423   6      
+ 424   6                              case 0x0C:{     // 关闭手动模式
+ 425   7                                  MANUAL_MODE_ENABLED = 0;
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 8   
+
+ 426   7                                  sendingFlag2 = 4; // 设置手动模式响应标志
+ 427   7                              } break;
+ 428   6                          }
+ 429   5                      }
+ 430   4                      wptr2 = 0;
+ 431   4                      headok = 0;
+ 432   4                      return;
+ 433   4                  }
+ 434   3              }
+ 435   2              else {
+ 436   3                  wptr2 = 0;
+ 437   3                  headok = 0;
+ 438   3                  return;
+ 439   3              }
+ 440   2              wptr2++;
+ 441   2              wptr2 &= 0x0f;  // 循环缓冲区
+ 442   2          }
+ 443   1      }
+ 444          
+ 445          // UART2初始化
+ 446          void Uart2Init() {
+ 447   1          S2CON = 0x10;  // 设置串口模式
+ 448   1          T2L = BRT;     // 设置波特率低字节
+ 449   1          T2H = BRT >> 8; // 设置波特率高字节
+ 450   1          wptr2 = 0x00;  // 初始化写指针
+ 451   1          busy2 = 0;     // 初始化忙标志
+ 452   1          IE2 = 1;       // 使能UART2中断
+ 453   1          EA = 1;        // 全局中断使能
+ 454   1      }
+ 455          
+ 456          // UART2发送单个字符
+ 457          void Uart2Send(char dat) {
+ 458   1          while (busy2);  // 等待发送完成
+ 459   1          busy2 = 1;      // 设置忙标志
+ 460   1          S2BUF = dat;    // 发送数据
+ 461   1      }
+ 462          
+ 463          // UART2发送字符串
+ 464          void Uart2SendStr(char *p, unsigned char size) {
+ 465   1          unsigned char i = 0;
+ 466   1          while (i < size) {
+ 467   2              Uart2Send(p[i]);  // 逐个发送字符
+ 468   2              i++;
+ 469   2          }
+ 470   1      }
+ 471          /********************************UART2 Setting***********************************/
+ 472          
+ 473          /********************************ADC Setting***********************************/
+ 474          //unsigned int *BGV ;
+ 475          unsigned int VCC;  // 电源电压
+ 476          unsigned int RES;  // ADC结果
+ 477          
+ 478          // 启动ADC
+ 479          void ADCStart() {
+ 480   1          ADCCFG = 0x2f;      // 配置ADC
+ 481   1          ADC_CONTR = 0x8E;   // 使能ADC
+ 482   1          ADCTIM &= 0xE0;     // 清除采样时间设置
+ 483   1          ADCTIM |= 0x0F;     // 设置采样时间
+ 484   1      }
+ 485          
+ 486          // 停止ADC
+ 487          void ADCStop() {
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 9   
+
+ 488   1          ADC_CONTR &= ~0x80; // 禁用ADC
+ 489   1      }
+ 490          
+ 491          // 读取ADC值
+ 492          int ADCRead() {
+ 493   1          int tmpres;
+ 494   1      
+ 495   1          ADC_CONTR |= 0x40;  // 启动AD转换
+ 496   1          _nop_();
+ 497   1          _nop_();
+ 498   1          while (!(ADC_CONTR & 0x20));  // 等待转换完成
+ 499   1          ADC_CONTR &= ~0x20;           // 清除完成标志
+ 500   1          tmpres = (ADC_RES << 8) | ADC_RESL;  // 读取ADC结果
+ 501   1      
+ 502   1          return tmpres;
+ 503   1      }
+ 504          
+ 505          // 计算电池百分比
+ 506          void batteryPrecentage2(int Voltage) {
+ 507   1          char ischarge;
+ 508   1          float tmp = Voltage * 1.0f / 1000.0f;
+ 509   1          int tmpInt = 0;
+ 510   1      
+ 511   1          CALCULATE_COUNT++;
+ 512   1          ischarge = 0;
+ 513   1      
+ 514   1          // 根据初始化状态和计算次数处理电压值
+ 515   1          if(FIRST_INIT == 1) {
+ 516   2              if(CALCULATE_COUNT > 2) {
+ 517   3                  FIRST_INIT = 0;
+ 518   3                  CALCULATE_COUNT = 0;
+ 519   3                  tmpInt = VOLTAGE_NUM;
+ 520   3                  DISPLAY_NUM = tmpInt;
+ 521   3                  return;
+ 522   3              }
+ 523   2          }
+ 524   1          else if(FIRST_INIT == 2) {
+ 525   2              if(CALCULATE_COUNT > CRCOUNT) {
+ 526   3                  FIRST_INIT = 0;
+ 527   3                  CALCULATE_COUNT = 0;
+ 528   3                  tmpInt = VOLTAGE_NUM / (CRCOUNT - 1);
+ 529   3                  if(tmpInt > DISPLAY_NUM || DISPLAY_NUM > 100) {
+ 530   4                      DISPLAY_NUM = tmpInt;
+ 531   4                  } else if(tmpInt < DISPLAY_NUM && DISPLAY_NUM - tmpInt > 5) {
+ 532   4                      DISPLAY_NUM = tmpInt;
+ 533   4                  }
+ 534   3                  return;
+ 535   3              }
+ 536   2          }
+ 537   1          else {
+ 538   2              if(CALCULATE_COUNT > 21) {
+ 539   3                  CALCULATE_COUNT = 0;
+ 540   3                  tmpInt = (VOLTAGE_NUM / 20);
+ 541   3                  if(tmpInt > DISPLAY_NUM && tmpInt - DISPLAY_NUM > 5) {
+ 542   4                      DISPLAY_NUM = tmpInt;
+ 543   4                  }
+ 544   3                  if(tmpInt < DISPLAY_NUM) {
+ 545   4                      DISPLAY_NUM = tmpInt;
+ 546   4                  }
+ 547   3                  return;
+ 548   3              }
+ 549   2          }
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 10  
+
+ 550   1      
+ 551   1          if(CALCULATE_COUNT == 1) {
+ 552   2              VOLTAGE_NUM = 0;
+ 553   2              return;
+ 554   2          }
+ 555   1      
+ 556   1          // 根据电压值计算电池百分比
+ 557   1          if(Voltage >= 4100) {
+ 558   2              if(ischarge == 0) {
+ 559   3                  VOLTAGE_NUM += 100;
+ 560   3              } else {
+ 561   3                  if(Voltage >= 4120) {
+ 562   4                      VOLTAGE_NUM += 100;
+ 563   4                  } else {
+ 564   4                      VOLTAGE_NUM += 95;
+ 565   4                  }
+ 566   3              }
+ 567   2          }
+ 568   1          else if(Voltage >= 3960 && Voltage < 4100) {
+ 569   2              VOLTAGE_NUM += (unsigned int)((1 - ((tmp - 4.14f) / -0.8f )) * 100.0f);
+ 570   2          }
+ 571   1          else if (Voltage >= 3220 && Voltage < 3960) {
+ 572   2              VOLTAGE_NUM += (unsigned int)((1 - ((tmp - 4.193f) / -1.043f)) * 100.0f);
+ 573   2          }
+ 574   1          else if (Voltage >= 3020 && Voltage < 3220) {
+ 575   2              VOLTAGE_NUM += 5;
+ 576   2          }
+ 577   1          else if (Voltage < 3020) {
+ 578   2              VOLTAGE_NUM += 1;
+ 579   2          }
+ 580   1      }
+ 581          
+ 582          // 读取电压
+ 583          void ReadVoltage(char update) {
+ 584   1          int i;
+ 585   1          int tmpvcc;
+ 586   1          unsigned int vs;
+ 587   1      
+ 588   1          vs = 0;
+ 589   1          RES = 0;
+ 590   1          VCC = 0;
+ 591   1      
+ 592   1          ADCStart();
+ 593   1          ADCRead();  // 丢弃第一次读数
+ 594   1          ADCRead();  // 丢弃第二次读数
+ 595   1      
+ 596   1          // 读取8次并取平均值
+ 597   1          for(i=0; i < 8; i++) {
+ 598   2              RES += ADCRead();
+ 599   2          }
+ 600   1          RES >>= 3;
+ 601   1      
+ 602   1          // 计算电压值
+ 603   1          tmpvcc = (int)(5030L * RES / 1024L);
+ 604   1          if(update == 1) {
+ 605   2              // 转换为12V电压
+ 606   2              vs = (unsigned int)((tmpvcc * (25L + 10L)) / 10L);
+ 607   2              VCC = vs / 3;
+ 608   2              batteryPrecentage2(VCC);  // 计算电池百分比
+ 609   2          }
+ 610   1      
+ 611   1          ADCStop();
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 11  
+
+ 612   1      }
+ 613          
+ 614          /********************************Timer0 Setting***********************************/
+ 615          int T0COUNTER;   // 定时器0计数器
+ 616          int RVCOUNTER;   // 电压读取计数器
+ 617          int LPCOUNTER;   // 低功耗计数器
+ 618          
+ 619          // 定时器0初始化
+ 620          void timer0Init() {
+ 621   1          TH0 = 0x27;  // 设置定时器高字节
+ 622   1          TL0 = 0xff;  // 设置定时器低字节
+ 623   1      }
+ 624          
+ 625          // 启动定时器0
+ 626          void timer0Start() {
+ 627   1          T0COUNTER = 0;
+ 628   1          RVCOUNTER = 0;
+ 629   1          SCCOUNTER = 0;
+ 630   1          ET0 = 1;    // 使能定时器0中断
+ 631   1          EA = 1;     // 全局中断使能
+ 632   1          TR0 = 1;    // 启动定时器0
+ 633   1      }
+ 634          
+ 635          // 定时器0中断服务程序
+ 636          void timer0_ISR() interrupt 1 {
+ 637   1          T0COUNTER++;
+ 638   1          SCCOUNTER++;
+ 639   1          LPCOUNTER++;
+ 640   1      
+ 641   1          // 每50次中断(约50ms)执行一次
+ 642   1          if(T0COUNTER > 50) {
+ 643   2              T0COUNTER = 0;
+ 644   2              RVCOUNTER++;
+ 645   2      
+ 646   2              // 首次初始化处理
+ 647   2              if(FIRST_INIT == 1) {
+ 648   3                  RVCOUNTER = RVREADTIMEOUT;
+ 649   3              }
+ 650   2      
+ 651   2              // 电压读取逻辑
+ 652   2              if(RVCOUNTER == RVREADTIMEOUT) {
+ 653   3                  FIRST_INIT = 2;
+ 654   3                  CALCULATE_COUNT = 0;
+ 655   3                  ReadVoltage(1);  // 读取电压并更新
+ 656   3              }
+ 657   2              else if(RVCOUNTER > RVREADTIMEOUT && RVCOUNTER <= RVREADTIMEOUT + CRCOUNT) {
+ 658   3                  ReadVoltage(1);  // 读取电压并更新
+ 659   3              }
+ 660   2              else if(RVCOUNTER > RVREADTIMEOUT + CRCOUNT) {
+ 661   3                  RVCOUNTER = 0;
+ 662   3              }
+ 663   2      
+ 664   2              // 低功耗处理
+ 665   2              if(LPCOUNTER > 25) {
+ 666   3                  LPCOUNTER = 0;
+ 667   3                  if(LOW_POWER_MODE == 0) {
+ 668   4                      P32 = 1;  // 设置P3.2高电平
+ 669   4                      P33 = 1;  // 设置P3.3高电平
+ 670   4                  }
+ 671   3                  if(LOW_POWER_MODE == 3) {
+ 672   4                      P32 = 1;  // 设置P3.2高电平
+ 673   4                  }
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 12  
+
+ 674   3              }
+ 675   2      
+ 676   2              // 门控打开时禁用休眠(RTC_V1.1.0注释)
+ 677   2              // if(GATE_STATUS == 1) {
+ 678   2              //     SCCOUNTER = 0;
+ 679   2              // }
+ 680   2      
+ 681   2              /* 修改休眠计数器逻辑 */
+ 682   2              if(!MANUAL_MODE_ENABLED) { // 仅非手动模式增加计数器
+ 683   3                  SCCOUNTER++;
+ 684   3              }
+ 685   2              else {
+ 686   3                  SCCOUNTER = 0; // 手动模式下始终保持活跃
+ 687   3              }
+ 688   2      
+ 689   2              // 修改休眠超时处理（原：(SCCOUNTER > SCTIMEOUT)）
+ 690   2              if(SCCOUNTER > SCTIMEOUT && !MANUAL_MODE_ENABLED) {
+ 691   3                  if(LOW_POWER_MODE == 0 || LOW_POWER_MODE == 3) {
+ 692   4                      LOW_POWER_MODE = 1;
+ 693   4                      P32 = 0;  // 设置P3.2低电平
+ 694   4                      P33 = 0;  // 设置P3.3低电平
+ 695   4                      LED = 1;  // 关闭LED
+ 696   4                      RVCOUNTER = 0;
+ 697   4                      ADCStop();  // 停止ADC
+ 698   4                  }
+ 699   3      
+ 700   3                  if(SCCOUNTER > (SCTIMEOUT+25)) {
+ 701   4                      SCCOUNTER = 0;
+ 702   4                      TR0 = 0;  // 停止定时器0
+ 703   4                      TR1 = 0;  // 停止定时器1
+ 704   4                      WKTCL = TMPWKTCL;  // 设置唤醒定时器低字节
+ 705   4                      WKTCH = TMPWKTCH;  // 设置唤醒定时器高字节
+ 706   4                      LOW_POWER_MODE = 2;  // 进入深度低功耗模式
+ 707   4                  }
+ 708   3              }
+ 709   2          }
+ 710   1      }
+ 711          
+ 712          /**
+ 713           * Genta_New
+ 714           * @brief 检查是否需要唤醒(根据当前模式)
+ 715           * @param currentTime 当前时间(时间戳)
+ 716           * @return 1:需要唤醒, 0:不需要
+ 717           */
+ 718          char checkWakeupTime(long currentTime) {
+ 719   1          // 从时间戳中提取分钟数(0-59)
+ 720   1          char current_min = (currentTime / 60) % 60;
+ 721   1      
+ 722   1          // 如果分钟数未变化，不需要重复唤醒
+ 723   1          if(current_min == LAST_WAKE_MIN) {
+ 724   2              return 0;
+ 725   2          }
+ 726   1      
+ 727   1          // 根据当前模式检查唤醒条件
+ 728   1          switch(WAKE_MODE) {
+ 729   2              case WAKE_INTERVAL:  // 间隔唤醒(保持原有逻辑)
+ 730   2                  return (WKCOUNTER >= WKTIMEOUT);
+ 731   2      
+ 732   2              case WAKE_HOURLY:    // 整点唤醒(00分)
+ 733   2                  if(current_min == 0) {
+ 734   3                      LAST_WAKE_MIN = current_min;
+ 735   3                      return 1;
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 13  
+
+ 736   3                  }
+ 737   2                  break;
+ 738   2      
+ 739   2              case WAKE_HALF_HOUR: // 半点唤醒(30分)
+ 740   2                  if(current_min == 30) {
+ 741   3                      LAST_WAKE_MIN = current_min;
+ 742   3                      return 1;
+ 743   3                  }
+ 744   2                  break;
+ 745   2      
+ 746   2              case WAKE_QUARTER_HOUR: // 每15分钟唤醒(00,15,30,45分)
+ 747   2                  if(current_min % 15 == 0) {
+ 748   3                      LAST_WAKE_MIN = current_min;
+ 749   3                      return 1;
+ 750   3                  }
+ 751   2                  break;
+ 752   2          }
+ 753   1      
+ 754   1          return 0;
+ 755   1      }
+ 756          
+ 757          
+ 758          
+ 759          /********************************Timer1 Setting***********************************/
+ 760          
+ 761          // 定时器1初始化
+ 762          void timer1Init() {
+ 763   1          TH1 = 0x54;  // 设置定时器高字节(50ms)
+ 764   1          TL1 = 0xA3;  // 设置定时器低字节
+ 765   1      }
+ 766          
+ 767          // 启动定时器1
+ 768          void timer1Start() {
+ 769   1          ET1 = 1;  // 使能定时器1中断
+ 770   1          EA = 1;   // 全局中断使能
+ 771   1          TR1 = 1;  // 启动定时器1
+ 772   1      }
+ 773          
+ 774          // 定时器1中断服务程序
+ 775          void timer1_ISR() interrupt 3 {
+ 776   1          T1COUNTER++;
+ 777   1          T1MSGCOUNTER++;
+ 778   1      
+ 779   1          // 每20次中断(约1秒)执行一次
+ 780   1          if(T1COUNTER > 20) {
+ 781   2              T1COUNTER = 0;
+ 782   2              WDT_CONTR = 0x37;  // 重置看门狗
+ 783   2              DATETIME++;        // 系统时间递增
+ 784   2      
+ 785   2              if(LOW_POWER_MODE == 0 || LOW_POWER_MODE == 3) {
+ 786   3                  RTC_INT_Flag = 1;  // 设置RTC中断标志
+ 787   3              }
+ 788   2          }
+ 789   1      
+ 790   1          // 门控激活时间检查
+ 791   1          if(T1COUNTER == GATE_ACTIVATING) {
+ 792   2              GATE_ACTIVATING = -1;
+ 793   2              RESETGATE();  // 复位门控引脚
+ 794   2          }
+ 795   1      
+ 796   1          // 每200次中断(约10秒)发送一次心跳消息
+ 797   1          if(T1MSGCOUNTER > 200) {
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 14  
+
+ 798   2              T1MSGCOUNTER = 0;
+ 799   2              sendingFlag2 = 3;  // 设置心跳发送标志
+ 800   2          }
+ 801   1      }
+ 802          
+ 803          /********************************Timer1 Setting***********************************/
+ 804          
+ 805          
+ 806          // todo MAIN
+ 807          void main() {
+ 808   1          char datetimeCal;   //新增
+ 809   1          char gateStartCheckRes;
+ 810   1          int tmpCRC;
+ 811   1          char xdata str[30];
+ 812   1      
+ 813   1          // 校准掉电唤醒定时器计数(10秒唤醒一次)
+ 814   1          F32K = (int idata *)0x0f8;
+ 815   1          GetWakeupTimerCount();
+ 816   1      
+ 817   1          // 启动看门狗
+ 818   1          WDT_CONTR = 0x27;
+ 819   1      
+ 820   1          // 系统初始化
+ 821   1          FIRST_INIT = 1;
+ 822   1          LOW_POWER_MODE = 0;
+ 823   1          WKCOUNTER = 0;
+ 824   1          WKTIMEOUT = 18;
+ 825   1          SCTIMEOUT = 3000;  // 正式刷机改回5000
+ 826   1          RTC_INT_Flag = 0;
+ 827   1          datetimeCal = 0;
+ 828   1      
+ 829   1          // 开启额外RAM
+ 830   1          AUXR |= 0x17;
+ 831   1          AUXR &= ~0x02;
+ 832   1      
+ 833   1          // 设置P37上拉电阻
+ 834   1          P3PU &= 0x7F;
+ 835   1      
+ 836   1          // 设置引脚模式
+ 837   1          P1M1 = 0x00;
+ 838   1          P1M0 |= 0x04;  // P1.2(LED)输出
+ 839   1          P1M1 &= 0xF7;
+ 840   1          P1M0 |= 0x08;  // P1.3输出
+ 841   1          P1M1 &= 0xEF;
+ 842   1          P1M0 |= 0x10;  // P1.4输出
+ 843   1          P3M1 &= 0xFB;
+ 844   1          P3M0 |= 0x04;  // P3.2输出
+ 845   1          P3M1 &= 0xF7;
+ 846   1          P3M0 |= 0x08;  // P3.3输出
+ 847   1          P3M1 |= 0x40;
+ 848   1          P3M0 &= 0xBF;  // P3.6高阻输入
+ 849   1      
+ 850   1          // 初始化引脚状态
+ 851   1          P32 = 1;
+ 852   1          P33 = 1;
+ 853   1      
+ 854   1          // 从ROM加载配置
+ 855   1          LoadConfig();
+ 856   1      
+ 857   1          // 初始化显示数值
+ 858   1          DISPLAY_NUM = 0xbc;
+ 859   1          VOLTAGE_NUM = 0;
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 15  
+
+ 860   1          CALCULATE_COUNT = 0;
+ 861   1      
+ 862   1          // 初始化UART2
+ 863   1          Uart2Init();
+ 864   1      
+ 865   1          // 初始化定时器
+ 866   1          TMOD |= 0x00;
+ 867   1          timer0Init();
+ 868   1          timer0Start();
+ 869   1          timer1Init();
+ 870   1          timer1Start();
+ 871   1      
+ 872   1          // 初始化系统时间和水阀状态
+ 873   1          DATETIME = 1744287444;
+ 874   1          RESETGATE();
+ 875   1          CLOSEGATE();
+ 876   1      
+ 877   1          // 主循环
+ 878   1          while (1) {
+ 879   2              // 处理发送标志
+ 880   2              if(sendingFlag2 == 1) {  // 发送电池响应
+ 881   3                  Uart2SendStr(BATRESP, 9);
+ 882   3                  sendingFlag2 = 0;
+ 883   3              }
+ 884   2              if(sendingFlag2 == 2) {  // 发送休眠响应
+ 885   3                  Uart2SendStr(SLEEPRESP, 8);
+ 886   3                  sendingFlag2 = 0;
+ 887   3              }
+ 888   2      
+ 889   2              if(sendingFlag2 == 3) {  // 发送心跳消息
+ 890   3                  // 构建心跳消息
+ 891   3                  HARTBEATMSG[0] = 0x29;
+ 892   3                  HARTBEATMSG[1] = 0x29;
+ 893   3                  HARTBEATMSG[2] = 0x0A;  // 指令编号
+ 894   3                  HARTBEATMSG[3] = 0x00;  // 数据长度高字节
+ 895   3                  HARTBEATMSG[4] = 0x10;  // 数据长度低字节
+ 896   3                  longToByteArray(DATETIME, HARTBEATMSG, 5);  // 当前时间
+ 897   3                  HARTBEATMSG[9] = GATE_STATUS & 0xff;  // 阀门状态
+ 898   3                  HARTBEATMSG[10] = GATE_WORK_ENABLE & 0xff;  // 任务开关
+ 899   3                  longToByteArray(GATE_START_TIME, HARTBEATMSG, 11);  // 任务开始时间
+ 900   3                  HARTBEATMSG[15] = (GATE_WORK_DURATION >> 8) & 0xff;  // 任务持续时间高字节
+ 901   3                  HARTBEATMSG[16] = (char)(GATE_WORK_DURATION & 0x00ff) & 0xff;  // 任务持续时间低字节
+ 902   3                  HARTBEATMSG[17] = (TMPWKTIMEOUT >> 8) & 0xff;  // 休眠唤醒间隔高字节
+ 903   3                  HARTBEATMSG[18] = (char)(TMPWKTIMEOUT & 0x00ff) & 0xff;  // 休眠唤醒间隔低字节
+ 904   3                  HARTBEATMSG[19] = (TMPSCTIMEOUT >> 8) & 0xff;  // 休眠空虚等待时间高字节
+ 905   3                  HARTBEATMSG[20] = (char)(TMPSCTIMEOUT & 0x00ff) & 0xff;  // 休眠空虚等待时间低字节
+ 906   3                  HARTBEATMSG[21] = (GATE_WORK_COUNTDOWN >> 8) & 0xff;  // 倒计时高字节
+ 907   3                  HARTBEATMSG[22] = (char)(GATE_WORK_COUNTDOWN & 0x00ff) & 0xff;  // 倒计时低字节
+ 908   3      
+ 909   3                  // Genta_New 增加心跳中现十当前唤醒模式
+ 910   3                  HARTBEATMSG[23] = WAKE_MODE;  // 当前唤醒模式
+ 911   3                  HARTBEATMSG[24] = MANUAL_MODE_ENABLED; // 新增手动模式状态位
+ 912   3                  // 计算CRC
+ 913   3                  tmpCRC = MODBUS_CRC16(HARTBEATMSG, 25);
+ 914   3                  HARTBEATMSG[25] = (tmpCRC >> 8) & 0xff;  // CRC高字节
+ 915   3                  HARTBEATMSG[26] = (char)(tmpCRC & 0x00ff) & 0xff;  // CRC低字节
+ 916   3                  HARTBEATMSG[27] = 0x0D;  // 结束符
+ 917   3      
+ 918   3                  Uart2SendStr(HARTBEATMSG, 28);  // 发送心跳消息
+ 919   3                  sendingFlag2 = 0;
+ 920   3              }
+ 921   2              /* 新增手动模式响应处理 */
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 16  
+
+ 922   2              if(sendingFlag2 == 4) {
+ 923   3                  unsigned int crc;
+ 924   3                  manual_resp[5] = MANUAL_MODE_ENABLED;  // 更新模式状态
+ 925   3                  crc = MODBUS_CRC16(manual_resp, 6);
+ 926   3                  manual_resp[6] = crc & 0xFF;
+ 927   3                  manual_resp[7] = (crc >> 8) & 0xFF;
+ 928   3                  Uart2SendStr(manual_resp, 9);
+ 929   3                  sendingFlag2 = 0;
+ 930   3              }
+ 931   2      
+ 932   2              // 低功耗模式处理   Genta_New
+ 933   2              if(LOW_POWER_MODE == 2) {
+ 934   3                  PCON |= 0x02;  // MCU进入掉电模式
+ 935   3                  WKCOUNTER++;
+ 936   3                  WDT_CONTR = 0x37;  // 重置看门狗
+ 937   3                  DATETIME += 10;    // 系统时间递增(唤醒间隔周期10s)
+ 938   3                              datetimeCal ++;
+ 939   3                              if(datetimeCal > 5) {
+ 940   4                                      datetimeCal = 0;
+ 941   4                                      DATETIME = DATETIME + 2;
+ 942   4                              }
+ 943   3                  // // 检查门控启动条件(提前20秒)
+ 944   3                  // if(doGateStartChecker(20) == 1) {
+ 945   3                  //     WKCOUNTER = 0;
+ 946   3                  //     SCCOUNTER = 0;
+ 947   3                  //     LOW_POWER_MODE = 0;
+ 948   3                  //     LPCOUNTER = 25;
+ 949   3                  //     T1COUNTER = 0;
+ 950   3                  //     T1MSGCOUNTER = 0;
+ 951   3                  //     TR0 = 1;  // 启动定时器0
+ 952   3                  //     TR1 = 1;  // 启动定时器1
+ 953   3                  // }
+ 954   3      
+ 955   3                  // 替换原有的WKCOUNTER检查
+ 956   3                  if(checkWakeupTime(DATETIME)) {
+ 957   4                      WKCOUNTER = 0;
+ 958   4                      SCCOUNTER = 0;
+ 959   4                      LOW_POWER_MODE = 0;
+ 960   4                      LPCOUNTER = 25;
+ 961   4                      T1COUNTER = 0;
+ 962   4                      T1MSGCOUNTER = 0;
+ 963   4                      TR0 = 1;  // 启动定时器0
+ 964   4                      TR1 = 1;  // 启动定时器1
+ 965   4                  }
+ 966   3      
+ 967   3                  // 唤醒超时处理
+ 968   3                  if(WKCOUNTER >= WKTIMEOUT) {
+ 969   4                      WKCOUNTER = 0;
+ 970   4                      LOW_POWER_MODE = 3;
+ 971   4                      SCCOUNTER = (SCTIMEOUT / 2);
+ 972   4                      TR0 = 1;  // 启动定时器0
+ 973   4                      TR1 = 1;  // 启动定时器1
+ 974   4                  }
+ 975   3              }
+ 976   2      
+ 977   2              // RTC中断处理
+ 978   2                  if(RTC_INT_Flag == 1) {
+ 979   3                      RTC_INT_Flag = 0;
+ 980   3                      /* 仅在非手动模式执行自动控制 */
+ 981   3                      if(!MANUAL_MODE_ENABLED) {
+ 982   4                      // 水阀倒计时处理
+ 983   4                      if(GATE_WORK_COUNTDOWN > 0) {
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 17  
+
+ 984   5                          GATE_WORK_COUNTDOWN--;
+ 985   5                      }
+ 986   4      
+ 987   4                      // 检查水阀启动条件
+ 988   4                      gateStartCheckRes = doGateStartChecker(0);
+ 989   4                      if(gateStartCheckRes != 0) {
+ 990   5                          SCCOUNTER = 0;
+ 991   5                          LOW_POWER_MODE = 0;
+ 992   5                      }
+ 993   4      
+ 994   4                      // 根据检查结果处理水阀
+ 995   4                      switch(gateStartCheckRes) {
+ 996   5                          case 1: {  // 需要开水阀
+ 997   6                              GATE_WORK_COUNTDOWN = GATE_WORK_DURATION;
+ 998   6                              OPENGATE();
+ 999   6                              sendingFlag2 = 3;  // 发送心跳消息
+1000   6                          } break;
+1001   5      
+1002   5                          case 3: {  // 需要关水阀
+1003   6                              CLOSEGATE();
+1004   6                              if(DATETIME - (GATE_START_TIME) < 600) {
+1005   7                                  GATE_START_TIME -= 600;
+1006   7                              }
+1007   6                              sendingFlag2 = 3;  // 发送心跳消息
+1008   6                          } break;
+1009   5                      }
+1010   4                  }
+1011   3              }
+1012   2          }
+1013   1      }
+*** WARNING C280 IN LINE 811 OF main.c: 'str': unreferenced local variable
+1014          /*******************************工作机制说明*******************************
+1015          1. 指令协议：
+1016             - 开启手动：29 29 0B 00 00 [CRC16] 0D
+1017             - 关闭手动：29 29 0C 00 00 [CRC16] 0D
+1018          ***********************************************************************/
+*** WARNING C316 IN LINE 1018 OF main.c: unterminated conditionals
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 18  
+
+ASSEMBLY LISTING OF GENERATED OBJECT CODE
+
+
+             ; FUNCTION OPENGATE (BEGIN)
+                                           ; SOURCE LINE # 127
+                                           ; SOURCE LINE # 128
+0000 209335            JB      P13,?C0004
+0003 209432            JB      P14,?C0004
+                                           ; SOURCE LINE # 130
+0006 AF00        R     MOV     R7,T1COUNTER
+0008 EF                MOV     A,R7
+0009 33                RLC     A
+000A 95E0              SUBB    A,ACC
+000C FE                MOV     R6,A
+000D EF                MOV     A,R7
+000E 240A              ADD     A,#0AH
+0010 FF                MOV     R7,A
+0011 E4                CLR     A
+0012 3E                ADDC    A,R6
+0013 FE                MOV     R6,A
+0014 D3                SETB    C
+0015 EF                MOV     A,R7
+0016 9414              SUBB    A,#014H
+0018 EE                MOV     A,R6
+0019 6480              XRL     A,#080H
+001B 9480              SUBB    A,#080H
+001D E500        R     MOV     A,T1COUNTER
+001F 4005              JC      ?C0002
+0021 24F6              ADD     A,#0F6H
+0023 FF                MOV     R7,A
+0024 8003              SJMP    ?C0003
+0026         ?C0002:
+0026 240A              ADD     A,#0AH
+0028 FF                MOV     R7,A
+0029         ?C0003:
+0029 900000      R     MOV     DPTR,#GATE_ACTIVATING
+002C EF                MOV     A,R7
+002D F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 131
+002E D293              SETB    P13
+                                           ; SOURCE LINE # 132
+0030 C294              CLR     P14
+                                           ; SOURCE LINE # 133
+0032 900000      R     MOV     DPTR,#GATE_STATUS
+0035 7401              MOV     A,#01H
+0037 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 134
+                                           ; SOURCE LINE # 135
+0038         ?C0004:
+0038 22                RET     
+             ; FUNCTION OPENGATE (END)
+
+             ; FUNCTION CLOSEGATE (BEGIN)
+                                           ; SOURCE LINE # 138
+                                           ; SOURCE LINE # 139
+0000 209334            JB      P13,?C0008
+0003 209431            JB      P14,?C0008
+                                           ; SOURCE LINE # 141
+0006 AF00        R     MOV     R7,T1COUNTER
+0008 EF                MOV     A,R7
+0009 33                RLC     A
+000A 95E0              SUBB    A,ACC
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 19  
+
+000C FE                MOV     R6,A
+000D EF                MOV     A,R7
+000E 240A              ADD     A,#0AH
+0010 FF                MOV     R7,A
+0011 E4                CLR     A
+0012 3E                ADDC    A,R6
+0013 FE                MOV     R6,A
+0014 D3                SETB    C
+0015 EF                MOV     A,R7
+0016 9414              SUBB    A,#014H
+0018 EE                MOV     A,R6
+0019 6480              XRL     A,#080H
+001B 9480              SUBB    A,#080H
+001D E500        R     MOV     A,T1COUNTER
+001F 4005              JC      ?C0006
+0021 24F6              ADD     A,#0F6H
+0023 FF                MOV     R7,A
+0024 8003              SJMP    ?C0007
+0026         ?C0006:
+0026 240A              ADD     A,#0AH
+0028 FF                MOV     R7,A
+0029         ?C0007:
+0029 900000      R     MOV     DPTR,#GATE_ACTIVATING
+002C EF                MOV     A,R7
+002D F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 142
+002E C293              CLR     P13
+                                           ; SOURCE LINE # 143
+0030 D294              SETB    P14
+                                           ; SOURCE LINE # 144
+0032 E4                CLR     A
+0033 900000      R     MOV     DPTR,#GATE_STATUS
+0036 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 145
+                                           ; SOURCE LINE # 146
+0037         ?C0008:
+0037 22                RET     
+             ; FUNCTION CLOSEGATE (END)
+
+             ; FUNCTION RESETGATE (BEGIN)
+                                           ; SOURCE LINE # 149
+                                           ; SOURCE LINE # 150
+0000 C293              CLR     P13
+                                           ; SOURCE LINE # 151
+0002 C294              CLR     P14
+                                           ; SOURCE LINE # 152
+0004 22                RET     
+             ; FUNCTION RESETGATE (END)
+
+             ; FUNCTION _doGateStartChecker (BEGIN)
+                                           ; SOURCE LINE # 155
+0000 8F00        R     MOV     early,R7
+                                           ; SOURCE LINE # 156
+0002 900000      R     MOV     DPTR,#DATETIME
+0005 E0                MOVX    A,@DPTR
+0006 FC                MOV     R4,A
+0007 A3                INC     DPTR
+0008 E0                MOVX    A,@DPTR
+0009 FD                MOV     R5,A
+000A A3                INC     DPTR
+000B E0                MOVX    A,@DPTR
+000C FE                MOV     R6,A
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 20  
+
+000D A3                INC     DPTR
+000E E0                MOVX    A,@DPTR
+000F FF                MOV     R7,A
+0010 C004              PUSH    AR4
+0012 C005              PUSH    AR5
+0014 C006              PUSH    AR6
+0016 C007              PUSH    AR7
+0018 900000      R     MOV     DPTR,#GATE_START_TIME
+001B E0                MOVX    A,@DPTR
+001C FC                MOV     R4,A
+001D A3                INC     DPTR
+001E E0                MOVX    A,@DPTR
+001F FD                MOV     R5,A
+0020 A3                INC     DPTR
+0021 E0                MOVX    A,@DPTR
+0022 FE                MOV     R6,A
+0023 A3                INC     DPTR
+0024 E0                MOVX    A,@DPTR
+0025 FF                MOV     R7,A
+0026 C007              PUSH    AR7
+0028 AF00        R     MOV     R7,early
+002A AB07              MOV     R3,AR7
+002C EB                MOV     A,R3
+002D 33                RLC     A
+002E 95E0              SUBB    A,ACC
+0030 FA                MOV     R2,A
+0031 F9                MOV     R1,A
+0032 F8                MOV     R0,A
+0033 D007              POP     AR7
+0035 C3                CLR     C
+0036 EF                MOV     A,R7
+0037 9B                SUBB    A,R3
+0038 F500        E     MOV     ?_GateStartChecker?BYTE+07H,A
+003A EE                MOV     A,R6
+003B 9A                SUBB    A,R2
+003C F500        E     MOV     ?_GateStartChecker?BYTE+06H,A
+003E ED                MOV     A,R5
+003F 99                SUBB    A,R1
+0040 F500        E     MOV     ?_GateStartChecker?BYTE+05H,A
+0042 EC                MOV     A,R4
+0043 98                SUBB    A,R0
+0044 F500        E     MOV     ?_GateStartChecker?BYTE+04H,A
+0046 900000      R     MOV     DPTR,#GATE_WORK_DURATION
+0049 E0                MOVX    A,@DPTR
+004A F500        E     MOV     ?_GateStartChecker?BYTE+08H,A
+004C A3                INC     DPTR
+004D E0                MOVX    A,@DPTR
+004E F500        E     MOV     ?_GateStartChecker?BYTE+09H,A
+0050 900000      R     MOV     DPTR,#GATE_WORK_ENABLE
+0053 A3                INC     DPTR
+0054 E0                MOVX    A,@DPTR
+0055 F500        E     MOV     ?_GateStartChecker?BYTE+0AH,A
+0057 900000      R     MOV     DPTR,#GATE_STATUS
+005A E0                MOVX    A,@DPTR
+005B F500        E     MOV     ?_GateStartChecker?BYTE+0BH,A
+005D A3                INC     DPTR
+005E E0                MOVX    A,@DPTR
+005F F500        E     MOV     ?_GateStartChecker?BYTE+0CH,A
+0061 A3                INC     DPTR
+0062 E0                MOVX    A,@DPTR
+0063 F500        E     MOV     ?_GateStartChecker?BYTE+0DH,A
+0065 D007              POP     AR7
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 21  
+
+0067 D006              POP     AR6
+0069 D005              POP     AR5
+006B D004              POP     AR4
+006D 120000      E     LCALL   _GateStartChecker
+                                           ; SOURCE LINE # 159
+0070         ?C0010:
+0070 22                RET     
+             ; FUNCTION _doGateStartChecker (END)
+
+             ; FUNCTION GetWakeupTimerCount (BEGIN)
+                                           ; SOURCE LINE # 178
+                                           ; SOURCE LINE # 181
+0000 AB00        R     MOV     R3,F32K
+0002 AA00        R     MOV     R2,F32K+01H
+0004 A900        R     MOV     R1,F32K+02H
+0006 120000      E     LCALL   ?C?ILDPTR
+0009 85F000      R     MOV     tmpf32k,B
+000C F500        R     MOV     tmpf32k+01H,A
+                                           ; SOURCE LINE # 182
+000E 900000      R     MOV     DPTR,#WAKEUPTIMERCOUNT
+0011 7457              MOV     A,#057H
+0013 F0                MOVX    @DPTR,A
+0014 A3                INC     DPTR
+0015 7417              MOV     A,#017H
+0017 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 185
+0018 900000      R     MOV     DPTR,#WAKEUPTIMERCOUNT
+001B E0                MOVX    A,@DPTR
+001C FC                MOV     R4,A
+001D A3                INC     DPTR
+001E E0                MOVX    A,@DPTR
+001F 900000      R     MOV     DPTR,#TMPWKTCL
+0022 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 186
+0023 E4                CLR     A
+0024 900000      R     MOV     DPTR,#TMPWKTCH
+0027 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 187
+0028 EC                MOV     A,R4
+0029 FF                MOV     R7,A
+002A E0                MOVX    A,@DPTR
+002B 2F                ADD     A,R7
+002C F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 188
+002D E0                MOVX    A,@DPTR
+002E 2480              ADD     A,#080H
+0030 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 189
+0031 22                RET     
+             ; FUNCTION GetWakeupTimerCount (END)
+
+             ; FUNCTION ReadBat (BEGIN)
+                                           ; SOURCE LINE # 191
+                                           ; SOURCE LINE # 193
+0000 900000      R     MOV     DPTR,#BATRESP+05H
+0003 E500        R     MOV     A,DISPLAY_NUM+01H
+0005 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 196
+0006 7B01              MOV     R3,#01H
+0008 7A00        R     MOV     R2,#HIGH BATRESP
+000A 7900        R     MOV     R1,#LOW BATRESP
+000C 7D06              MOV     R5,#06H
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 22  
+
+000E 120000      E     LCALL   _MODBUS_CRC16
+;---- Variable 'crc' assigned to Register 'R4/R5' ----
+0011 AC06              MOV     R4,AR6
+                                           ; SOURCE LINE # 197
+0013 EF                MOV     A,R7
+0014 900000      R     MOV     DPTR,#BATRESP+06H
+0017 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 198
+0018 EC                MOV     A,R4
+0019 A3                INC     DPTR
+001A F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 200
+001B 750001      R     MOV     sendingFlag2,#01H
+                                           ; SOURCE LINE # 201
+001E 22                RET     
+             ; FUNCTION ReadBat (END)
+
+             ; FUNCTION LoadConfig (BEGIN)
+                                           ; SOURCE LINE # 203
+                                           ; SOURCE LINE # 207
+0000 7B01              MOV     R3,#01H
+0002 7A00        R     MOV     R2,#HIGH GATE_WORK_ENABLE
+0004 7900        R     MOV     R1,#LOW GATE_WORK_ENABLE
+0006 7F00              MOV     R7,#00H
+0008 7E0E              MOV     R6,#0EH
+000A 120000      E     LCALL   _IapGet2byteData
+                                           ; SOURCE LINE # 210
+000D 7B00              MOV     R3,#00H
+000F 7A00        R     MOV     R2,#HIGH tmpDatetime
+0011 7900        R     MOV     R1,#LOW tmpDatetime
+0013 7D04              MOV     R5,#04H
+0015 7C00              MOV     R4,#00H
+0017 7F02              MOV     R7,#02H
+0019 7E0E              MOV     R6,#0EH
+001B 120000      E     LCALL   _IapReadWithSize
+                                           ; SOURCE LINE # 211
+001E 7800        R     MOV     R0,#LOW tmpDatetime
+0020 E6                MOV     A,@R0
+0021 FF                MOV     R7,A
+0022 E4                CLR     A
+0023 FC                MOV     R4,A
+0024 FD                MOV     R5,A
+0025 FE                MOV     R6,A
+0026 900000      R     MOV     DPTR,#GATE_START_TIME
+0029 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 212
+002C 900000      R     MOV     DPTR,#GATE_START_TIME
+002F E0                MOVX    A,@DPTR
+0030 FC                MOV     R4,A
+0031 A3                INC     DPTR
+0032 E0                MOVX    A,@DPTR
+0033 FD                MOV     R5,A
+0034 A3                INC     DPTR
+0035 E0                MOVX    A,@DPTR
+0036 FE                MOV     R6,A
+0037 A3                INC     DPTR
+0038 E0                MOVX    A,@DPTR
+0039 FF                MOV     R7,A
+003A 7808              MOV     R0,#08H
+003C 120000      E     LCALL   ?C?LSHL
+003F 900000      R     MOV     DPTR,#GATE_START_TIME
+0042 120000      E     LCALL   ?C?LSTXDATA
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 23  
+
+                                           ; SOURCE LINE # 213
+0045 900000      R     MOV     DPTR,#GATE_START_TIME
+0048 E0                MOVX    A,@DPTR
+0049 F8                MOV     R0,A
+004A A3                INC     DPTR
+004B E0                MOVX    A,@DPTR
+004C F9                MOV     R1,A
+004D A3                INC     DPTR
+004E E0                MOVX    A,@DPTR
+004F FA                MOV     R2,A
+0050 A3                INC     DPTR
+0051 E0                MOVX    A,@DPTR
+0052 FB                MOV     R3,A
+0053 C000              PUSH    AR0
+0055 7800        R     MOV     R0,#LOW tmpDatetime+01H
+0057 E6                MOV     A,@R0
+0058 FF                MOV     R7,A
+0059 E4                CLR     A
+005A FC                MOV     R4,A
+005B FD                MOV     R5,A
+005C FE                MOV     R6,A
+005D D000              POP     AR0
+005F EB                MOV     A,R3
+0060 2F                ADD     A,R7
+0061 FF                MOV     R7,A
+0062 EE                MOV     A,R6
+0063 3A                ADDC    A,R2
+0064 FE                MOV     R6,A
+0065 ED                MOV     A,R5
+0066 39                ADDC    A,R1
+0067 FD                MOV     R5,A
+0068 EC                MOV     A,R4
+0069 38                ADDC    A,R0
+006A FC                MOV     R4,A
+006B 900000      R     MOV     DPTR,#GATE_START_TIME
+006E 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 214
+0071 900000      R     MOV     DPTR,#GATE_START_TIME
+0074 E0                MOVX    A,@DPTR
+0075 FC                MOV     R4,A
+0076 A3                INC     DPTR
+0077 E0                MOVX    A,@DPTR
+0078 FD                MOV     R5,A
+0079 A3                INC     DPTR
+007A E0                MOVX    A,@DPTR
+007B FE                MOV     R6,A
+007C A3                INC     DPTR
+007D E0                MOVX    A,@DPTR
+007E FF                MOV     R7,A
+007F 7808              MOV     R0,#08H
+0081 120000      E     LCALL   ?C?LSHL
+0084 900000      R     MOV     DPTR,#GATE_START_TIME
+0087 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 215
+008A 900000      R     MOV     DPTR,#GATE_START_TIME
+008D E0                MOVX    A,@DPTR
+008E F8                MOV     R0,A
+008F A3                INC     DPTR
+0090 E0                MOVX    A,@DPTR
+0091 F9                MOV     R1,A
+0092 A3                INC     DPTR
+0093 E0                MOVX    A,@DPTR
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 24  
+
+0094 FA                MOV     R2,A
+0095 A3                INC     DPTR
+0096 E0                MOVX    A,@DPTR
+0097 FB                MOV     R3,A
+0098 C000              PUSH    AR0
+009A 7800        R     MOV     R0,#LOW tmpDatetime+02H
+009C E6                MOV     A,@R0
+009D FF                MOV     R7,A
+009E E4                CLR     A
+009F FC                MOV     R4,A
+00A0 FD                MOV     R5,A
+00A1 FE                MOV     R6,A
+00A2 D000              POP     AR0
+00A4 EB                MOV     A,R3
+00A5 2F                ADD     A,R7
+00A6 FF                MOV     R7,A
+00A7 EE                MOV     A,R6
+00A8 3A                ADDC    A,R2
+00A9 FE                MOV     R6,A
+00AA ED                MOV     A,R5
+00AB 39                ADDC    A,R1
+00AC FD                MOV     R5,A
+00AD EC                MOV     A,R4
+00AE 38                ADDC    A,R0
+00AF FC                MOV     R4,A
+00B0 900000      R     MOV     DPTR,#GATE_START_TIME
+00B3 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 216
+00B6 900000      R     MOV     DPTR,#GATE_START_TIME
+00B9 E0                MOVX    A,@DPTR
+00BA FC                MOV     R4,A
+00BB A3                INC     DPTR
+00BC E0                MOVX    A,@DPTR
+00BD FD                MOV     R5,A
+00BE A3                INC     DPTR
+00BF E0                MOVX    A,@DPTR
+00C0 FE                MOV     R6,A
+00C1 A3                INC     DPTR
+00C2 E0                MOVX    A,@DPTR
+00C3 FF                MOV     R7,A
+00C4 7808              MOV     R0,#08H
+00C6 120000      E     LCALL   ?C?LSHL
+00C9 900000      R     MOV     DPTR,#GATE_START_TIME
+00CC 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 217
+00CF 900000      R     MOV     DPTR,#GATE_START_TIME
+00D2 E0                MOVX    A,@DPTR
+00D3 F8                MOV     R0,A
+00D4 A3                INC     DPTR
+00D5 E0                MOVX    A,@DPTR
+00D6 F9                MOV     R1,A
+00D7 A3                INC     DPTR
+00D8 E0                MOVX    A,@DPTR
+00D9 FA                MOV     R2,A
+00DA A3                INC     DPTR
+00DB E0                MOVX    A,@DPTR
+00DC FB                MOV     R3,A
+00DD C000              PUSH    AR0
+00DF 7800        R     MOV     R0,#LOW tmpDatetime+03H
+00E1 E6                MOV     A,@R0
+00E2 FF                MOV     R7,A
+00E3 E4                CLR     A
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 25  
+
+00E4 FC                MOV     R4,A
+00E5 FD                MOV     R5,A
+00E6 FE                MOV     R6,A
+00E7 D000              POP     AR0
+00E9 EB                MOV     A,R3
+00EA 2F                ADD     A,R7
+00EB FF                MOV     R7,A
+00EC EE                MOV     A,R6
+00ED 3A                ADDC    A,R2
+00EE FE                MOV     R6,A
+00EF ED                MOV     A,R5
+00F0 39                ADDC    A,R1
+00F1 FD                MOV     R5,A
+00F2 EC                MOV     A,R4
+00F3 38                ADDC    A,R0
+00F4 FC                MOV     R4,A
+00F5 900000      R     MOV     DPTR,#GATE_START_TIME
+00F8 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 220
+00FB 7B01              MOV     R3,#01H
+00FD 7A00        R     MOV     R2,#HIGH GATE_WORK_DURATION
+00FF 7900        R     MOV     R1,#LOW GATE_WORK_DURATION
+0101 7F06              MOV     R7,#06H
+0103 7E0E              MOV     R6,#0EH
+0105 120000      E     LCALL   _IapGet2byteData
+                                           ; SOURCE LINE # 223
+0108 7B01              MOV     R3,#01H
+010A 7A00        R     MOV     R2,#HIGH TMPSCTIMEOUT
+010C 7900        R     MOV     R1,#LOW TMPSCTIMEOUT
+010E 7F02              MOV     R7,#02H
+0110 7E0C              MOV     R6,#0CH
+0112 120000      E     LCALL   _IapGet2byteData
+                                           ; SOURCE LINE # 224
+0115 7B01              MOV     R3,#01H
+0117 7A00        R     MOV     R2,#HIGH TMPWKTIMEOUT
+0119 7900        R     MOV     R1,#LOW TMPWKTIMEOUT
+011B 7F00              MOV     R7,#00H
+011D 7E0C              MOV     R6,#0CH
+011F 120000      E     LCALL   _IapGet2byteData
+                                           ; SOURCE LINE # 227
+0122 900000      R     MOV     DPTR,#TMPSCTIMEOUT
+0125 E0                MOVX    A,@DPTR
+0126 FE                MOV     R6,A
+0127 A3                INC     DPTR
+0128 E0                MOVX    A,@DPTR
+0129 FF                MOV     R7,A
+012A C3                CLR     C
+012B 943C              SUBB    A,#03CH
+012D EE                MOV     A,R6
+012E 6480              XRL     A,#080H
+0130 9480              SUBB    A,#080H
+0132 4010              JC      ?C0013
+                                           ; SOURCE LINE # 228
+0134 7C00              MOV     R4,#00H
+0136 7D64              MOV     R5,#064H
+0138 120000      E     LCALL   ?C?IMUL
+013B 7D06              MOV     R5,#06H
+013D 120000      E     LCALL   ?C?SIDIV
+0140 8E00        R     MOV     SCTIMEOUT,R6
+0142 8F00        R     MOV     SCTIMEOUT+01H,R7
+                                           ; SOURCE LINE # 229
+0144         ?C0013:
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 26  
+
+                                           ; SOURCE LINE # 230
+0144 900000      R     MOV     DPTR,#TMPWKTIMEOUT
+0147 E0                MOVX    A,@DPTR
+0148 FE                MOV     R6,A
+0149 A3                INC     DPTR
+014A E0                MOVX    A,@DPTR
+014B FF                MOV     R7,A
+014C C3                CLR     C
+014D 943C              SUBB    A,#03CH
+014F EE                MOV     A,R6
+0150 6480              XRL     A,#080H
+0152 9480              SUBB    A,#080H
+0154 400B              JC      ?C0014
+                                           ; SOURCE LINE # 231
+0156 7C00              MOV     R4,#00H
+0158 7D0A              MOV     R5,#0AH
+015A 120000      E     LCALL   ?C?SIDIV
+015D 8E00        R     MOV     WKTIMEOUT,R6
+015F 8F00        R     MOV     WKTIMEOUT+01H,R7
+                                           ; SOURCE LINE # 232
+0161         ?C0014:
+                                           ; SOURCE LINE # 235
+0161 E4                CLR     A
+0162 F500        R     MOV     SCCOUNTER,A
+0164 F500        R     MOV     SCCOUNTER+01H,A
+                                           ; SOURCE LINE # 236
+0166 F500        R     MOV     WKCOUNTER,A
+0168 F500        R     MOV     WKCOUNTER+01H,A
+                                           ; SOURCE LINE # 237
+016A 22                RET     
+             ; FUNCTION LoadConfig (END)
+
+             ; FUNCTION Uart2Isr (BEGIN)
+0000 C0E0              PUSH    ACC
+0002 C0F0              PUSH    B
+0004 C083              PUSH    DPH
+0006 C082              PUSH    DPL
+0008 C0D0              PUSH    PSW
+000A 75D000            MOV     PSW,#00H
+000D C000              PUSH    AR0
+000F C001              PUSH    AR1
+0011 C002              PUSH    AR2
+0013 C003              PUSH    AR3
+0015 C004              PUSH    AR4
+0017 C005              PUSH    AR5
+0019 C006              PUSH    AR6
+001B C007              PUSH    AR7
+                                           ; SOURCE LINE # 332
+                                           ; SOURCE LINE # 333
+001D E59A              MOV     A,S2CON
+001F 30E106            JNB     ACC.1,?C0016
+                                           ; SOURCE LINE # 334
+0022 539AFD            ANL     S2CON,#0FDH
+                                           ; SOURCE LINE # 335
+0025 750000      R     MOV     busy2,#00H
+                                           ; SOURCE LINE # 336
+0028         ?C0016:
+                                           ; SOURCE LINE # 337
+0028 E59A              MOV     A,S2CON
+002A 20E003            JB      ACC.0,$ + 6H
+002D 020000      R     LJMP    ?C0020
+                                           ; SOURCE LINE # 338
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 27  
+
+0030 539AFE            ANL     S2CON,#0FEH
+                                           ; SOURCE LINE # 341
+0033 750000      R     MOV     SCCOUNTER,#00H
+0036 750000      R     MOV     SCCOUNTER+01H,#00H
+                                           ; SOURCE LINE # 342
+0039 750000      R     MOV     LOW_POWER_MODE,#00H
+                                           ; SOURCE LINE # 345
+003C AF00        R     MOV     R7,wptr2
+003E EF                MOV     A,R7
+003F 33                RLC     A
+0040 95E0              SUBB    A,ACC
+0042 FE                MOV     R6,A
+0043 7400        R     MOV     A,#LOW buffer2
+0045 2F                ADD     A,R7
+0046 F582              MOV     DPL,A
+0048 7400        R     MOV     A,#HIGH buffer2
+004A 3E                ADDC    A,R6
+004B F583              MOV     DPH,A
+004D E59B              MOV     A,S2BUF
+004F F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 348
+0050 E500        R     MOV     A,wptr2
+0052 7018              JNZ     ?C0018
+                                           ; SOURCE LINE # 349
+0054 7400        R     MOV     A,#LOW buffer2
+0056 2F                ADD     A,R7
+0057 F582              MOV     DPL,A
+0059 7400        R     MOV     A,#HIGH buffer2
+005B 3E                ADDC    A,R6
+005C F583              MOV     DPH,A
+005E E0                MOVX    A,@DPTR
+005F 6429              XRL     A,#029H
+0061 7003              JNZ     $ + 5H
+0063 020000      R     LJMP    ?C0021
+                                           ; SOURCE LINE # 350
+0066 750000      R     MOV     wptr2,#00H
+0069 020000      R     LJMP    ?C0020
+                                           ; SOURCE LINE # 352
+                                           ; SOURCE LINE # 353
+006C         ?C0018:
+                                           ; SOURCE LINE # 354
+006C E500        R     MOV     A,wptr2
+006E B40127            CJNE    A,#01H,?C0022
+0071 FF                MOV     R7,A
+0072 33                RLC     A
+0073 95E0              SUBB    A,ACC
+0075 FE                MOV     R6,A
+0076 7400        R     MOV     A,#LOW buffer2
+0078 2F                ADD     A,R7
+0079 F582              MOV     DPL,A
+007B 7400        R     MOV     A,#HIGH buffer2
+007D 3E                ADDC    A,R6
+007E F583              MOV     DPH,A
+0080 E0                MOVX    A,@DPTR
+0081 B42914            CJNE    A,#029H,?C0022
+0084 7400        R     MOV     A,#LOW buffer2+0FFFFH
+0086 2F                ADD     A,R7
+0087 F582              MOV     DPL,A
+0089 7400        R     MOV     A,#HIGH buffer2+0FFFFH
+008B 3E                ADDC    A,R6
+008C F583              MOV     DPH,A
+008E E0                MOVX    A,@DPTR
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 28  
+
+008F B42906            CJNE    A,#029H,?C0022
+                                           ; SOURCE LINE # 355
+0092 750001      R     MOV     headok,#01H
+                                           ; SOURCE LINE # 356
+0095 020000      R     LJMP    ?C0021
+0098         ?C0022:
+                                           ; SOURCE LINE # 357
+0098 E500        R     MOV     A,headok
+009A 6401              XRL     A,#01H
+009C 6003              JZ      $ + 5H
+009E 020000      R     LJMP    ?C0024
+00A1 C3                CLR     C
+00A2 E500        R     MOV     A,wptr2
+00A4 6480              XRL     A,#080H
+00A6 9490              SUBB    A,#090H
+00A8 4003              JC      $ + 5H
+00AA 020000      R     LJMP    ?C0024
+                                           ; SOURCE LINE # 358
+00AD E500        R     MOV     A,wptr2
+00AF FD                MOV     R5,A
+00B0 33                RLC     A
+00B1 95E0              SUBB    A,ACC
+00B3 FC                MOV     R4,A
+00B4 7400        R     MOV     A,#LOW buffer2
+00B6 2D                ADD     A,R5
+00B7 F582              MOV     DPL,A
+00B9 7400        R     MOV     A,#HIGH buffer2
+00BB 3C                ADDC    A,R4
+00BC F583              MOV     DPH,A
+00BE E0                MOVX    A,@DPTR
+00BF 640D              XRL     A,#0DH
+00C1 6003              JZ      $ + 5H
+00C3 020000      R     LJMP    ?C0021
+                                           ; SOURCE LINE # 360
+00C6 900000      R     MOV     DPTR,#crcData
+00C9 F0                MOVX    @DPTR,A
+00CA A3                INC     DPTR
+00CB F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 361
+00CC 7400        R     MOV     A,#LOW buffer2+0FFFFH
+00CE 2D                ADD     A,R5
+00CF F582              MOV     DPL,A
+00D1 7400        R     MOV     A,#HIGH buffer2+0FFFFH
+00D3 3C                ADDC    A,R4
+00D4 F583              MOV     DPH,A
+00D6 E0                MOVX    A,@DPTR
+00D7 FF                MOV     R7,A
+00D8 900000      R     MOV     DPTR,#crcData+01H
+00DB E0                MOVX    A,@DPTR
+00DC 2F                ADD     A,R7
+00DD F0                MOVX    @DPTR,A
+00DE 900000      R     MOV     DPTR,#crcData
+00E1 E0                MOVX    A,@DPTR
+00E2 3400              ADDC    A,#00H
+00E4 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 362
+00E5 A3                INC     DPTR
+00E6 E0                MOVX    A,@DPTR
+00E7 F8                MOV     R0,A
+00E8 E4                CLR     A
+00E9 F0                MOVX    @DPTR,A
+00EA E8                MOV     A,R0
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 29  
+
+00EB 900000      R     MOV     DPTR,#crcData
+00EE F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 363
+00EF 7400        R     MOV     A,#LOW buffer2+0FFFEH
+00F1 2D                ADD     A,R5
+00F2 F582              MOV     DPL,A
+00F4 7400        R     MOV     A,#HIGH buffer2+0FFFEH
+00F6 3C                ADDC    A,R4
+00F7 F583              MOV     DPH,A
+00F9 E0                MOVX    A,@DPTR
+00FA FF                MOV     R7,A
+00FB 900000      R     MOV     DPTR,#crcData+01H
+00FE E0                MOVX    A,@DPTR
+00FF 2F                ADD     A,R7
+0100 F0                MOVX    @DPTR,A
+0101 900000      R     MOV     DPTR,#crcData
+0104 E0                MOVX    A,@DPTR
+0105 3400              ADDC    A,#00H
+0107 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 364
+0108 7B01              MOV     R3,#01H
+010A 7A00        R     MOV     R2,#HIGH buffer2
+010C 7900        R     MOV     R1,#LOW buffer2
+010E E500        R     MOV     A,wptr2
+0110 24FE              ADD     A,#0FEH
+0112 FD                MOV     R5,A
+0113 120000      E     LCALL   _MODBUS_CRC16
+0116 900000      R     MOV     DPTR,#crcRes
+0119 EE                MOV     A,R6
+011A F0                MOVX    @DPTR,A
+011B A3                INC     DPTR
+011C EF                MOV     A,R7
+011D F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 366
+011E 900000      R     MOV     DPTR,#crcData
+0121 E0                MOVX    A,@DPTR
+0122 6E                XRL     A,R6
+0123 7003              JNZ     ?C0144
+0125 A3                INC     DPTR
+0126 E0                MOVX    A,@DPTR
+0127 6F                XRL     A,R7
+0128         ?C0144:
+0128 6003              JZ      $ + 5H
+012A 020000      R     LJMP    ?C0158
+                                           ; SOURCE LINE # 367
+012D 900000      R     MOV     DPTR,#buffer2+02H
+0130 E0                MOVX    A,@DPTR
+0131 24FC              ADD     A,#0FCH
+0133 603A              JZ      ?C0030
+0135 14                DEC     A
+0136 6049              JZ      ?C0031
+0138 14                DEC     A
+0139 6062              JZ      ?C0035
+013B 14                DEC     A
+013C 7003              JNZ     $ + 5H
+013E 020000      R     LJMP    ?C0036
+0141 14                DEC     A
+0142 7003              JNZ     $ + 5H
+0144 020000      R     LJMP    ?C0037
+0147 24FD              ADD     A,#0FDH
+0149 7003              JNZ     $ + 5H
+014B 020000      R     LJMP    ?C0038
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 30  
+
+014E 14                DEC     A
+014F 7003              JNZ     $ + 5H
+0151 020000      R     LJMP    ?C0039
+0154 240B              ADD     A,#0BH
+0156 6003              JZ      $ + 5H
+0158 020000      R     LJMP    ?C0158
+                                           ; SOURCE LINE # 368
+015B         ?C0028:
+                                           ; SOURCE LINE # 369
+015B 900000      R     MOV     DPTR,#FIRST_INIT
+015E E0                MOVX    A,@DPTR
+015F 7008              JNZ     ?C0029
+                                           ; SOURCE LINE # 370
+0161 04                INC     A
+0162 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 371
+0163 750000      R     MOV     CALCULATE_COUNT,#00H
+0166 750000      R     MOV     CALCULATE_COUNT+01H,#00H
+                                           ; SOURCE LINE # 372
+0169         ?C0029:
+                                           ; SOURCE LINE # 373
+0169 120000      R     LCALL   ReadBat
+                                           ; SOURCE LINE # 374
+016C 020000      R     LJMP    ?C0158
+                                           ; SOURCE LINE # 376
+016F         ?C0030:
+                                           ; SOURCE LINE # 377
+016F E500        R     MOV     A,SCTIMEOUT+01H
+0171 249C              ADD     A,#09CH
+0173 F500        R     MOV     SCCOUNTER+01H,A
+0175 E500        R     MOV     A,SCTIMEOUT
+0177 34FF              ADDC    A,#0FFH
+0179 F500        R     MOV     SCCOUNTER,A
+                                           ; SOURCE LINE # 378
+017B 750002      R     MOV     sendingFlag2,#02H
+                                           ; SOURCE LINE # 379
+017E 020000      R     LJMP    ?C0158
+                                           ; SOURCE LINE # 381
+0181         ?C0031:
+                                           ; SOURCE LINE # 382
+0181 900000      R     MOV     DPTR,#buffer2+05H
+0184 E0                MOVX    A,@DPTR
+0185 FD                MOV     R5,A
+0186 B40106            CJNE    A,#01H,?C0032
+                                           ; SOURCE LINE # 383
+0189 120000      R     LCALL   OPENGATE
+                                           ; SOURCE LINE # 384
+018C 020000      R     LJMP    ?C0158
+018F         ?C0032:
+                                           ; SOURCE LINE # 385
+018F ED                MOV     A,R5
+0190 6402              XRL     A,#02H
+0192 6003              JZ      $ + 5H
+0194 020000      R     LJMP    ?C0158
+                                           ; SOURCE LINE # 386
+0197 120000      R     LCALL   CLOSEGATE
+                                           ; SOURCE LINE # 387
+                                           ; SOURCE LINE # 388
+019A 020000      R     LJMP    ?C0158
+                                           ; SOURCE LINE # 390
+019D         ?C0035:
+                                           ; SOURCE LINE # 391
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 31  
+
+019D 900000      R     MOV     DPTR,#buffer2+05H
+01A0 E0                MOVX    A,@DPTR
+01A1 FF                MOV     R7,A
+01A2 E4                CLR     A
+01A3 FC                MOV     R4,A
+01A4 FD                MOV     R5,A
+01A5 FE                MOV     R6,A
+01A6 900000      R     MOV     DPTR,#DATETIME
+01A9 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 392
+01AC 900000      R     MOV     DPTR,#DATETIME
+01AF E0                MOVX    A,@DPTR
+01B0 FC                MOV     R4,A
+01B1 A3                INC     DPTR
+01B2 E0                MOVX    A,@DPTR
+01B3 FD                MOV     R5,A
+01B4 A3                INC     DPTR
+01B5 E0                MOVX    A,@DPTR
+01B6 FE                MOV     R6,A
+01B7 A3                INC     DPTR
+01B8 E0                MOVX    A,@DPTR
+01B9 FF                MOV     R7,A
+01BA 7808              MOV     R0,#08H
+01BC 120000      E     LCALL   ?C?LSHL
+01BF 900000      R     MOV     DPTR,#DATETIME
+01C2 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 393
+01C5 900000      R     MOV     DPTR,#DATETIME
+01C8 E0                MOVX    A,@DPTR
+01C9 F8                MOV     R0,A
+01CA A3                INC     DPTR
+01CB E0                MOVX    A,@DPTR
+01CC F9                MOV     R1,A
+01CD A3                INC     DPTR
+01CE E0                MOVX    A,@DPTR
+01CF FA                MOV     R2,A
+01D0 A3                INC     DPTR
+01D1 E0                MOVX    A,@DPTR
+01D2 FB                MOV     R3,A
+01D3 900000      R     MOV     DPTR,#buffer2+06H
+01D6 E0                MOVX    A,@DPTR
+01D7 FF                MOV     R7,A
+01D8 E4                CLR     A
+01D9 FC                MOV     R4,A
+01DA FD                MOV     R5,A
+01DB FE                MOV     R6,A
+01DC EB                MOV     A,R3
+01DD 2F                ADD     A,R7
+01DE FF                MOV     R7,A
+01DF EE                MOV     A,R6
+01E0 3A                ADDC    A,R2
+01E1 FE                MOV     R6,A
+01E2 ED                MOV     A,R5
+01E3 39                ADDC    A,R1
+01E4 FD                MOV     R5,A
+01E5 EC                MOV     A,R4
+01E6 38                ADDC    A,R0
+01E7 FC                MOV     R4,A
+01E8 900000      R     MOV     DPTR,#DATETIME
+01EB 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 394
+01EE 900000      R     MOV     DPTR,#DATETIME
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 32  
+
+01F1 E0                MOVX    A,@DPTR
+01F2 FC                MOV     R4,A
+01F3 A3                INC     DPTR
+01F4 E0                MOVX    A,@DPTR
+01F5 FD                MOV     R5,A
+01F6 A3                INC     DPTR
+01F7 E0                MOVX    A,@DPTR
+01F8 FE                MOV     R6,A
+01F9 A3                INC     DPTR
+01FA E0                MOVX    A,@DPTR
+01FB FF                MOV     R7,A
+01FC 7808              MOV     R0,#08H
+01FE 120000      E     LCALL   ?C?LSHL
+0201 900000      R     MOV     DPTR,#DATETIME
+0204 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 395
+0207 900000      R     MOV     DPTR,#DATETIME
+020A E0                MOVX    A,@DPTR
+020B F8                MOV     R0,A
+020C A3                INC     DPTR
+020D E0                MOVX    A,@DPTR
+020E F9                MOV     R1,A
+020F A3                INC     DPTR
+0210 E0                MOVX    A,@DPTR
+0211 FA                MOV     R2,A
+0212 A3                INC     DPTR
+0213 E0                MOVX    A,@DPTR
+0214 FB                MOV     R3,A
+0215 900000      R     MOV     DPTR,#buffer2+07H
+0218 E0                MOVX    A,@DPTR
+0219 FF                MOV     R7,A
+021A E4                CLR     A
+021B FC                MOV     R4,A
+021C FD                MOV     R5,A
+021D FE                MOV     R6,A
+021E EB                MOV     A,R3
+021F 2F                ADD     A,R7
+0220 FF                MOV     R7,A
+0221 EE                MOV     A,R6
+0222 3A                ADDC    A,R2
+0223 FE                MOV     R6,A
+0224 ED                MOV     A,R5
+0225 39                ADDC    A,R1
+0226 FD                MOV     R5,A
+0227 EC                MOV     A,R4
+0228 38                ADDC    A,R0
+0229 FC                MOV     R4,A
+022A 900000      R     MOV     DPTR,#DATETIME
+022D 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 396
+0230 900000      R     MOV     DPTR,#DATETIME
+0233 E0                MOVX    A,@DPTR
+0234 FC                MOV     R4,A
+0235 A3                INC     DPTR
+0236 E0                MOVX    A,@DPTR
+0237 FD                MOV     R5,A
+0238 A3                INC     DPTR
+0239 E0                MOVX    A,@DPTR
+023A FE                MOV     R6,A
+023B A3                INC     DPTR
+023C E0                MOVX    A,@DPTR
+023D FF                MOV     R7,A
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 33  
+
+023E 7808              MOV     R0,#08H
+0240 120000      E     LCALL   ?C?LSHL
+0243 900000      R     MOV     DPTR,#DATETIME
+0246 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 397
+0249 900000      R     MOV     DPTR,#DATETIME
+024C E0                MOVX    A,@DPTR
+024D F8                MOV     R0,A
+024E A3                INC     DPTR
+024F E0                MOVX    A,@DPTR
+0250 F9                MOV     R1,A
+0251 A3                INC     DPTR
+0252 E0                MOVX    A,@DPTR
+0253 FA                MOV     R2,A
+0254 A3                INC     DPTR
+0255 E0                MOVX    A,@DPTR
+0256 FB                MOV     R3,A
+0257 900000      R     MOV     DPTR,#buffer2+08H
+025A E0                MOVX    A,@DPTR
+025B FF                MOV     R7,A
+025C E4                CLR     A
+025D FC                MOV     R4,A
+025E FD                MOV     R5,A
+025F FE                MOV     R6,A
+0260 EB                MOV     A,R3
+0261 2F                ADD     A,R7
+0262 FF                MOV     R7,A
+0263 EE                MOV     A,R6
+0264 3A                ADDC    A,R2
+0265 FE                MOV     R6,A
+0266 ED                MOV     A,R5
+0267 39                ADDC    A,R1
+0268 FD                MOV     R5,A
+0269 EC                MOV     A,R4
+026A 38                ADDC    A,R0
+026B FC                MOV     R4,A
+026C 900000      R     MOV     DPTR,#DATETIME
+026F 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 398
+                                           ; SOURCE LINE # 399
+0272 801E              SJMP    ?C0156
+                                           ; SOURCE LINE # 401
+0274         ?C0036:
+                                           ; SOURCE LINE # 405
+0274 7B01              MOV     R3,#01H
+0276 7A00        R     MOV     R2,#HIGH buffer2
+0278 7900        R     MOV     R1,#LOW buffer2
+027A 7D05              MOV     R5,#05H
+027C 120000      E     LCALL   _setWakeupSleepOptions
+                                           ; SOURCE LINE # 406
+027F 120000      R     LCALL   LoadConfig
+                                           ; SOURCE LINE # 407
+0282         ?C0155:
+                                           ; SOURCE LINE # 408
+0282 800E              SJMP    ?C0156
+                                           ; SOURCE LINE # 410
+0284         ?C0037:
+                                           ; SOURCE LINE # 411
+0284 7B01              MOV     R3,#01H
+0286 7A00        R     MOV     R2,#HIGH buffer2
+0288 7900        R     MOV     R1,#LOW buffer2
+028A 7D05              MOV     R5,#05H
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 34  
+
+028C 120000      E     LCALL   _setWorkingOptions
+                                           ; SOURCE LINE # 412
+028F 120000      R     LCALL   LoadConfig
+                                           ; SOURCE LINE # 413
+0292         ?C0156:
+0292 750003      R     MOV     sendingFlag2,#03H
+                                           ; SOURCE LINE # 414
+0295 801B              SJMP    ?C0158
+                                           ; SOURCE LINE # 417
+0297         ?C0038:
+                                           ; SOURCE LINE # 418
+0297 900000      R     MOV     DPTR,#MANUAL_MODE_ENABLED
+029A 7401              MOV     A,#01H
+029C F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 419
+029D 750000      R     MOV     SCCOUNTER,#00H
+02A0 750000      R     MOV     SCCOUNTER+01H,#00H
+                                           ; SOURCE LINE # 420
+02A3 750000      R     MOV     LOW_POWER_MODE,#00H
+                                           ; SOURCE LINE # 421
+                                           ; SOURCE LINE # 422
+02A6 8005              SJMP    ?C0157
+                                           ; SOURCE LINE # 424
+02A8         ?C0039:
+                                           ; SOURCE LINE # 425
+02A8 900000      R     MOV     DPTR,#MANUAL_MODE_ENABLED
+02AB E4                CLR     A
+02AC F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 426
+02AD         ?C0157:
+02AD 750004      R     MOV     sendingFlag2,#04H
+                                           ; SOURCE LINE # 427
+                                           ; SOURCE LINE # 428
+                                           ; SOURCE LINE # 429
+02B0         ?C0026:
+                                           ; SOURCE LINE # 430
+                                           ; SOURCE LINE # 431
+02B0 8000              SJMP    ?C0158
+                                           ; SOURCE LINE # 433
+                                           ; SOURCE LINE # 434
+02B2         ?C0024:
+                                           ; SOURCE LINE # 435
+                                           ; SOURCE LINE # 436
+02B2         ?C0158:
+02B2 750000      R     MOV     wptr2,#00H
+                                           ; SOURCE LINE # 437
+02B5 750000      R     MOV     headok,#00H
+02B8 8005              SJMP    ?C0020
+                                           ; SOURCE LINE # 439
+02BA         ?C0021:
+                                           ; SOURCE LINE # 440
+02BA 0500        R     INC     wptr2
+                                           ; SOURCE LINE # 441
+02BC 53000F      R     ANL     wptr2,#0FH
+                                           ; SOURCE LINE # 442
+                                           ; SOURCE LINE # 443
+02BF         ?C0020:
+02BF D007              POP     AR7
+02C1 D006              POP     AR6
+02C3 D005              POP     AR5
+02C5 D004              POP     AR4
+02C7 D003              POP     AR3
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 35  
+
+02C9 D002              POP     AR2
+02CB D001              POP     AR1
+02CD D000              POP     AR0
+02CF D0D0              POP     PSW
+02D1 D082              POP     DPL
+02D3 D083              POP     DPH
+02D5 D0F0              POP     B
+02D7 D0E0              POP     ACC
+02D9 32                RETI    
+             ; FUNCTION Uart2Isr (END)
+
+             ; FUNCTION Uart2Init (BEGIN)
+                                           ; SOURCE LINE # 446
+                                           ; SOURCE LINE # 447
+0000 759A10            MOV     S2CON,#010H
+                                           ; SOURCE LINE # 448
+0003 75D7E0            MOV     T2L,#0E0H
+                                           ; SOURCE LINE # 449
+0006 75D6FE            MOV     T2H,#0FEH
+                                           ; SOURCE LINE # 450
+0009 E4                CLR     A
+000A F500        R     MOV     wptr2,A
+                                           ; SOURCE LINE # 451
+000C F500        R     MOV     busy2,A
+                                           ; SOURCE LINE # 452
+000E 75AF01            MOV     IE2,#01H
+                                           ; SOURCE LINE # 453
+0011 D2AF              SETB    EA
+                                           ; SOURCE LINE # 454
+0013 22                RET     
+             ; FUNCTION Uart2Init (END)
+
+             ; FUNCTION _Uart2Send (BEGIN)
+                                           ; SOURCE LINE # 457
+;---- Variable 'dat' assigned to Register 'R7' ----
+0000         ?C0042:
+                                           ; SOURCE LINE # 458
+0000 E500        R     MOV     A,busy2
+0002 70FC              JNZ     ?C0042
+0004         ?C0043:
+                                           ; SOURCE LINE # 459
+0004 750001      R     MOV     busy2,#01H
+                                           ; SOURCE LINE # 460
+0007 8F9B              MOV     S2BUF,R7
+                                           ; SOURCE LINE # 461
+0009 22                RET     
+             ; FUNCTION _Uart2Send (END)
+
+             ; FUNCTION _Uart2SendStr (BEGIN)
+                                           ; SOURCE LINE # 464
+0000 8B00        R     MOV     p,R3
+0002 8A00        R     MOV     p+01H,R2
+0004 8900        R     MOV     p+02H,R1
+;---- Variable 'size' assigned to Register 'R5' ----
+                                           ; SOURCE LINE # 465
+;---- Variable 'i' assigned to Register 'R6' ----
+0006 E4                CLR     A
+0007 FE                MOV     R6,A
+0008         ?C0045:
+                                           ; SOURCE LINE # 466
+0008 EE                MOV     A,R6
+0009 C3                CLR     C
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 36  
+
+000A 9D                SUBB    A,R5
+000B 5015              JNC     ?C0047
+                                           ; SOURCE LINE # 467
+000D AB00        R     MOV     R3,p
+000F AA00        R     MOV     R2,p+01H
+0011 A900        R     MOV     R1,p+02H
+0013 8E82              MOV     DPL,R6
+0015 758300            MOV     DPH,#00H
+0018 120000      E     LCALL   ?C?CLDOPTR
+001B FF                MOV     R7,A
+001C 120000      R     LCALL   _Uart2Send
+                                           ; SOURCE LINE # 468
+001F 0E                INC     R6
+                                           ; SOURCE LINE # 469
+0020 80E6              SJMP    ?C0045
+                                           ; SOURCE LINE # 470
+0022         ?C0047:
+0022 22                RET     
+             ; FUNCTION _Uart2SendStr (END)
+
+             ; FUNCTION ADCStart (BEGIN)
+                                           ; SOURCE LINE # 479
+                                           ; SOURCE LINE # 480
+0000 75DE2F            MOV     ADCCFG,#02FH
+                                           ; SOURCE LINE # 481
+0003 75BC8E            MOV     ADC_CONTR,#08EH
+                                           ; SOURCE LINE # 482
+0006 90FEA8            MOV     DPTR,#0FEA8H
+0009 E0                MOVX    A,@DPTR
+000A 54E0              ANL     A,#0E0H
+000C F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 483
+000D E0                MOVX    A,@DPTR
+000E 440F              ORL     A,#0FH
+0010 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 484
+0011 22                RET     
+             ; FUNCTION ADCStart (END)
+
+             ; FUNCTION ADCStop (BEGIN)
+                                           ; SOURCE LINE # 487
+                                           ; SOURCE LINE # 488
+0000 53BC7F            ANL     ADC_CONTR,#07FH
+                                           ; SOURCE LINE # 489
+0003 22                RET     
+             ; FUNCTION ADCStop (END)
+
+             ; FUNCTION ADCRead (BEGIN)
+                                           ; SOURCE LINE # 492
+                                           ; SOURCE LINE # 495
+0000 43BC40            ORL     ADC_CONTR,#040H
+                                           ; SOURCE LINE # 496
+0003 00                NOP     
+                                           ; SOURCE LINE # 497
+0004 00                NOP     
+0005         ?C0050:
+                                           ; SOURCE LINE # 498
+0005 E5BC              MOV     A,ADC_CONTR
+0007 30E5FB            JNB     ACC.5,?C0050
+000A         ?C0051:
+                                           ; SOURCE LINE # 499
+000A 53BCDF            ANL     ADC_CONTR,#0DFH
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 37  
+
+                                           ; SOURCE LINE # 500
+000D AFBD              MOV     R7,ADC_RES
+000F EF                MOV     A,R7
+0010 FE                MOV     R6,A
+0011 ADBE              MOV     R5,ADC_RESL
+0013 ED                MOV     A,R5
+0014 FF                MOV     R7,A
+;---- Variable 'tmpres' assigned to Register 'R6/R7' ----
+                                           ; SOURCE LINE # 502
+                                           ; SOURCE LINE # 503
+0015         ?C0052:
+0015 22                RET     
+             ; FUNCTION ADCRead (END)
+
+             ; FUNCTION _batteryPrecentage2 (BEGIN)
+                                           ; SOURCE LINE # 506
+0000 8E00        R     MOV     Voltage,R6
+0002 8F00        R     MOV     Voltage+01H,R7
+                                           ; SOURCE LINE # 508
+0004 AC00        R     MOV     R4,Voltage
+0006 AD00        R     MOV     R5,Voltage+01H
+0008 EC                MOV     A,R4
+0009 120000      E     LCALL   ?C?FCASTI
+000C E4                CLR     A
+000D FB                MOV     R3,A
+000E FA                MOV     R2,A
+000F 797A              MOV     R1,#07AH
+0011 7844              MOV     R0,#044H
+0013 120000      E     LCALL   ?C?FPDIV
+0016 8F00        R     MOV     tmp+03H,R7
+0018 8E00        R     MOV     tmp+02H,R6
+001A 8D00        R     MOV     tmp+01H,R5
+001C 8C00        R     MOV     tmp,R4
+                                           ; SOURCE LINE # 509
+;---- Variable 'tmpInt' assigned to Register 'R6/R7' ----
+                                           ; SOURCE LINE # 511
+001E 0500        R     INC     CALCULATE_COUNT+01H
+0020 E500        R     MOV     A,CALCULATE_COUNT+01H
+0022 7002              JNZ     ?C0145
+0024 0500        R     INC     CALCULATE_COUNT
+0026         ?C0145:
+                                           ; SOURCE LINE # 512
+;---- Variable 'ischarge' assigned to Register 'R3' ----
+0026 E4                CLR     A
+0027 FB                MOV     R3,A
+                                           ; SOURCE LINE # 515
+0028 900000      R     MOV     DPTR,#FIRST_INIT
+002B E0                MOVX    A,@DPTR
+002C FD                MOV     R5,A
+002D B4011B            CJNE    A,#01H,?C0053
+                                           ; SOURCE LINE # 516
+0030 D3                SETB    C
+0031 E500        R     MOV     A,CALCULATE_COUNT+01H
+0033 9402              SUBB    A,#02H
+0035 E500        R     MOV     A,CALCULATE_COUNT
+0037 9400              SUBB    A,#00H
+0039 5003              JNC     $ + 5H
+003B 020000      R     LJMP    ?C0056
+                                           ; SOURCE LINE # 517
+003E E4                CLR     A
+003F F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 518
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 38  
+
+0040 F500        R     MOV     CALCULATE_COUNT,A
+0042 F500        R     MOV     CALCULATE_COUNT+01H,A
+                                           ; SOURCE LINE # 519
+0044 AE00        R     MOV     R6,VOLTAGE_NUM
+0046 AF00        R     MOV     R7,VOLTAGE_NUM+01H
+                                           ; SOURCE LINE # 520
+0048 020000      R     LJMP    ?C0162
+                                           ; SOURCE LINE # 522
+                                           ; SOURCE LINE # 523
+004B         ?C0053:
+                                           ; SOURCE LINE # 524
+004B ED                MOV     A,R5
+004C 6402              XRL     A,#02H
+004E 7053              JNZ     ?C0057
+                                           ; SOURCE LINE # 525
+0050 D3                SETB    C
+0051 E500        R     MOV     A,CALCULATE_COUNT+01H
+0053 9402              SUBB    A,#02H
+0055 E500        R     MOV     A,CALCULATE_COUNT
+0057 9400              SUBB    A,#00H
+0059 5003              JNC     $ + 5H
+005B 020000      R     LJMP    ?C0056
+                                           ; SOURCE LINE # 526
+005E E4                CLR     A
+005F 900000      R     MOV     DPTR,#FIRST_INIT
+0062 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 527
+0063 F500        R     MOV     CALCULATE_COUNT,A
+0065 F500        R     MOV     CALCULATE_COUNT+01H,A
+                                           ; SOURCE LINE # 528
+0067 AE00        R     MOV     R6,VOLTAGE_NUM
+0069 AF00        R     MOV     R7,VOLTAGE_NUM+01H
+                                           ; SOURCE LINE # 529
+006B D3                SETB    C
+006C EF                MOV     A,R7
+006D 9500        R     SUBB    A,DISPLAY_NUM+01H
+006F EE                MOV     A,R6
+0070 9500        R     SUBB    A,DISPLAY_NUM
+0072 500A              JNC     ?C0060
+0074 E500        R     MOV     A,DISPLAY_NUM+01H
+0076 9464              SUBB    A,#064H
+0078 E500        R     MOV     A,DISPLAY_NUM
+007A 9400              SUBB    A,#00H
+007C 4002              JC      ?C0059
+007E         ?C0060:
+                                           ; SOURCE LINE # 530
+007E         ?C0160:
+                                           ; SOURCE LINE # 531
+007E 8067              SJMP    ?C0162
+0080         ?C0059:
+0080 C3                CLR     C
+0081 EF                MOV     A,R7
+0082 9500        R     SUBB    A,DISPLAY_NUM+01H
+0084 EE                MOV     A,R6
+0085 9500        R     SUBB    A,DISPLAY_NUM
+0087 4003              JC      $ + 5H
+0089 020000      R     LJMP    ?C0055
+008C C3                CLR     C
+008D E500        R     MOV     A,DISPLAY_NUM+01H
+008F 9F                SUBB    A,R7
+0090 FD                MOV     R5,A
+0091 E500        R     MOV     A,DISPLAY_NUM
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 39  
+
+0093 9E                SUBB    A,R6
+0094 FC                MOV     R4,A
+0095 D3                SETB    C
+0096 ED                MOV     A,R5
+0097 9405              SUBB    A,#05H
+0099 EC                MOV     A,R4
+009A 9400              SUBB    A,#00H
+009C 5003              JNC     $ + 5H
+009E 020000      R     LJMP    ?C0055
+                                           ; SOURCE LINE # 532
+00A1         ?C0161:
+                                           ; SOURCE LINE # 533
+00A1 8044              SJMP    ?C0162
+                                           ; SOURCE LINE # 535
+                                           ; SOURCE LINE # 536
+00A3         ?C0057:
+                                           ; SOURCE LINE # 537
+                                           ; SOURCE LINE # 538
+00A3 D3                SETB    C
+00A4 E500        R     MOV     A,CALCULATE_COUNT+01H
+00A6 9415              SUBB    A,#015H
+00A8 E500        R     MOV     A,CALCULATE_COUNT
+00AA 9400              SUBB    A,#00H
+00AC 403E              JC      ?C0056
+                                           ; SOURCE LINE # 539
+00AE E4                CLR     A
+00AF F500        R     MOV     CALCULATE_COUNT,A
+00B1 F500        R     MOV     CALCULATE_COUNT+01H,A
+                                           ; SOURCE LINE # 540
+00B3 AE00        R     MOV     R6,VOLTAGE_NUM
+00B5 AF00        R     MOV     R7,VOLTAGE_NUM+01H
+00B7 FC                MOV     R4,A
+00B8 7D14              MOV     R5,#014H
+00BA 120000      E     LCALL   ?C?UIDIV
+                                           ; SOURCE LINE # 541
+00BD D3                SETB    C
+00BE EF                MOV     A,R7
+00BF 9500        R     SUBB    A,DISPLAY_NUM+01H
+00C1 EE                MOV     A,R6
+00C2 9500        R     SUBB    A,DISPLAY_NUM
+00C4 4015              JC      ?C0065
+00C6 EF                MOV     A,R7
+00C7 9500        R     SUBB    A,DISPLAY_NUM+01H
+00C9 FD                MOV     R5,A
+00CA EE                MOV     A,R6
+00CB 9500        R     SUBB    A,DISPLAY_NUM
+00CD FC                MOV     R4,A
+00CE D3                SETB    C
+00CF ED                MOV     A,R5
+00D0 9405              SUBB    A,#05H
+00D2 EC                MOV     A,R4
+00D3 9400              SUBB    A,#00H
+00D5 4004              JC      ?C0065
+                                           ; SOURCE LINE # 542
+00D7 8E00        R     MOV     DISPLAY_NUM,R6
+00D9 8F00        R     MOV     DISPLAY_NUM+01H,R7
+                                           ; SOURCE LINE # 543
+00DB         ?C0065:
+                                           ; SOURCE LINE # 544
+00DB C3                CLR     C
+00DC EF                MOV     A,R7
+00DD 9500        R     SUBB    A,DISPLAY_NUM+01H
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 40  
+
+00DF EE                MOV     A,R6
+00E0 9500        R     SUBB    A,DISPLAY_NUM
+00E2 4003              JC      $ + 5H
+00E4 020000      R     LJMP    ?C0055
+                                           ; SOURCE LINE # 545
+00E7         ?C0162:
+00E7 8E00        R     MOV     DISPLAY_NUM,R6
+00E9 8F00        R     MOV     DISPLAY_NUM+01H,R7
+                                           ; SOURCE LINE # 546
+00EB 22                RET     
+                                           ; SOURCE LINE # 548
+                                           ; SOURCE LINE # 549
+00EC         ?C0056:
+                                           ; SOURCE LINE # 551
+00EC E500        R     MOV     A,CALCULATE_COUNT+01H
+00EE 6401              XRL     A,#01H
+00F0 4500        R     ORL     A,CALCULATE_COUNT
+00F2 7005              JNZ     ?C0067
+                                           ; SOURCE LINE # 552
+00F4 F500        R     MOV     VOLTAGE_NUM,A
+00F6 F500        R     MOV     VOLTAGE_NUM+01H,A
+00F8 22                RET     
+                                           ; SOURCE LINE # 554
+00F9         ?C0067:
+                                           ; SOURCE LINE # 557
+00F9 C3                CLR     C
+00FA E500        R     MOV     A,Voltage+01H
+00FC 9404              SUBB    A,#04H
+00FE E500        R     MOV     A,Voltage
+0100 6480              XRL     A,#080H
+0102 9490              SUBB    A,#090H
+0104 401E              JC      ?C0068
+                                           ; SOURCE LINE # 558
+0106 EB                MOV     A,R3
+0107 7005              JNZ     ?C0069
+                                           ; SOURCE LINE # 559
+0109 7464              MOV     A,#064H
+                                           ; SOURCE LINE # 560
+010B 020000      R     LJMP    ?C0164
+010E         ?C0069:
+                                           ; SOURCE LINE # 561
+010E C3                CLR     C
+010F E500        R     MOV     A,Voltage+01H
+0111 9418              SUBB    A,#018H
+0113 E500        R     MOV     A,Voltage
+0115 6480              XRL     A,#080H
+0117 9490              SUBB    A,#090H
+0119 4004              JC      ?C0071
+                                           ; SOURCE LINE # 562
+011B 7464              MOV     A,#064H
+                                           ; SOURCE LINE # 563
+011D 8002              SJMP    ?C0159
+011F         ?C0071:
+                                           ; SOURCE LINE # 564
+011F 745F              MOV     A,#05FH
+0121         ?C0159:
+0121         ?C0163:
+                                           ; SOURCE LINE # 565
+                                           ; SOURCE LINE # 566
+                                           ; SOURCE LINE # 567
+0121 020000      R     LJMP    ?C0164
+0124         ?C0068:
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 41  
+
+                                           ; SOURCE LINE # 568
+0124 C3                CLR     C
+0125 E500        R     MOV     A,Voltage+01H
+0127 9478              SUBB    A,#078H
+0129 E500        R     MOV     A,Voltage
+012B 6480              XRL     A,#080H
+012D 948F              SUBB    A,#08FH
+012F 4027              JC      ?C0074
+0131 E500        R     MOV     A,Voltage+01H
+0133 9404              SUBB    A,#04H
+0135 E500        R     MOV     A,Voltage
+0137 6480              XRL     A,#080H
+0139 9490              SUBB    A,#090H
+013B 501B              JNC     ?C0074
+                                           ; SOURCE LINE # 569
+013D 7FE1              MOV     R7,#0E1H
+013F 7E7A              MOV     R6,#07AH
+0141 7D84              MOV     R5,#084H
+0143 7CC0              MOV     R4,#0C0H
+0145 AB00        R     MOV     R3,tmp+03H
+0147 AA00        R     MOV     R2,tmp+02H
+0149 A900        R     MOV     R1,tmp+01H
+014B A800        R     MOV     R0,tmp
+014D 120000      E     LCALL   ?C?FPADD
+0150 7BCD              MOV     R3,#0CDH
+0152 7ACC              MOV     R2,#0CCH
+0154 794C              MOV     R1,#04CH
+                                           ; SOURCE LINE # 570
+0156 8032              SJMP    ?C0165
+0158         ?C0074:
+                                           ; SOURCE LINE # 571
+0158 C3                CLR     C
+0159 E500        R     MOV     A,Voltage+01H
+015B 9494              SUBB    A,#094H
+015D E500        R     MOV     A,Voltage
+015F 6480              XRL     A,#080H
+0161 948C              SUBB    A,#08CH
+0163 4051              JC      ?C0076
+0165 E500        R     MOV     A,Voltage+01H
+0167 9478              SUBB    A,#078H
+0169 E500        R     MOV     A,Voltage
+016B 6480              XRL     A,#080H
+016D 948F              SUBB    A,#08FH
+016F 5045              JNC     ?C0076
+                                           ; SOURCE LINE # 572
+0171 7F0E              MOV     R7,#0EH
+0173 7E2D              MOV     R6,#02DH
+0175 7D86              MOV     R5,#086H
+0177 7CC0              MOV     R4,#0C0H
+0179 AB00        R     MOV     R3,tmp+03H
+017B AA00        R     MOV     R2,tmp+02H
+017D A900        R     MOV     R1,tmp+01H
+017F A800        R     MOV     R0,tmp
+0181 120000      E     LCALL   ?C?FPADD
+0184 7B06              MOV     R3,#06H
+0186 7A81              MOV     R2,#081H
+0188 7985              MOV     R1,#085H
+018A         ?C0165:
+018A 78BF              MOV     R0,#0BFH
+018C 120000      E     LCALL   ?C?FPDIV
+018F A804              MOV     R0,AR4
+0191 A905              MOV     R1,AR5
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 42  
+
+0193 AA06              MOV     R2,AR6
+0195 AB07              MOV     R3,AR7
+0197 E4                CLR     A
+0198 FF                MOV     R7,A
+0199 FE                MOV     R6,A
+019A 7D80              MOV     R5,#080H
+019C 7C3F              MOV     R4,#03FH
+019E 120000      E     LCALL   ?C?FPSUB
+01A1 E4                CLR     A
+01A2 FB                MOV     R3,A
+01A3 FA                MOV     R2,A
+01A4 79C8              MOV     R1,#0C8H
+01A6 7842              MOV     R0,#042H
+01A8 120000      E     LCALL   ?C?FPMUL
+01AB 120000      E     LCALL   ?C?CASTF
+01AE EF                MOV     A,R7
+01AF 2500        R     ADD     A,VOLTAGE_NUM+01H
+01B1 F500        R     MOV     VOLTAGE_NUM+01H,A
+01B3 EE                MOV     A,R6
+                                           ; SOURCE LINE # 573
+01B4 8020              SJMP    ?C0166
+01B6         ?C0076:
+                                           ; SOURCE LINE # 574
+01B6 C3                CLR     C
+01B7 E500        R     MOV     A,Voltage+01H
+01B9 94CC              SUBB    A,#0CCH
+01BB E500        R     MOV     A,Voltage
+01BD 6480              XRL     A,#080H
+01BF 948B              SUBB    A,#08BH
+01C1 4018              JC      ?C0078
+01C3 E500        R     MOV     A,Voltage+01H
+01C5 9494              SUBB    A,#094H
+01C7 E500        R     MOV     A,Voltage
+01C9 6480              XRL     A,#080H
+01CB 948C              SUBB    A,#08CH
+01CD 500C              JNC     ?C0078
+                                           ; SOURCE LINE # 575
+01CF 7405              MOV     A,#05H
+01D1         ?C0164:
+01D1 2500        R     ADD     A,VOLTAGE_NUM+01H
+01D3 F500        R     MOV     VOLTAGE_NUM+01H,A
+01D5 E4                CLR     A
+01D6         ?C0166:
+01D6 3500        R     ADDC    A,VOLTAGE_NUM
+01D8 F500        R     MOV     VOLTAGE_NUM,A
+                                           ; SOURCE LINE # 576
+01DA 22                RET     
+01DB         ?C0078:
+                                           ; SOURCE LINE # 577
+01DB C3                CLR     C
+01DC E500        R     MOV     A,Voltage+01H
+01DE 94CC              SUBB    A,#0CCH
+01E0 E500        R     MOV     A,Voltage
+01E2 6480              XRL     A,#080H
+01E4 948B              SUBB    A,#08BH
+01E6 5008              JNC     ?C0055
+                                           ; SOURCE LINE # 578
+01E8 0500        R     INC     VOLTAGE_NUM+01H
+01EA E500        R     MOV     A,VOLTAGE_NUM+01H
+01EC 7002              JNZ     ?C0146
+01EE 0500        R     INC     VOLTAGE_NUM
+01F0         ?C0146:
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 43  
+
+                                           ; SOURCE LINE # 579
+                                           ; SOURCE LINE # 580
+01F0         ?C0055:
+01F0 22                RET     
+             ; FUNCTION _batteryPrecentage2 (END)
+
+             ; FUNCTION _ReadVoltage (BEGIN)
+                                           ; SOURCE LINE # 583
+0000 8F00        R     MOV     update,R7
+                                           ; SOURCE LINE # 588
+0002 E4                CLR     A
+0003 F500        R     MOV     vs,A
+0005 F500        R     MOV     vs+01H,A
+                                           ; SOURCE LINE # 589
+0007 F500        R     MOV     RES,A
+0009 F500        R     MOV     RES+01H,A
+                                           ; SOURCE LINE # 590
+000B F500        R     MOV     VCC,A
+000D F500        R     MOV     VCC+01H,A
+                                           ; SOURCE LINE # 592
+000F 120000      R     LCALL   ADCStart
+                                           ; SOURCE LINE # 593
+0012 120000      R     LCALL   ADCRead
+                                           ; SOURCE LINE # 594
+0015 120000      R     LCALL   ADCRead
+                                           ; SOURCE LINE # 597
+;---- Variable 'i' assigned to Register 'R2/R3' ----
+0018 E4                CLR     A
+0019 FB                MOV     R3,A
+001A FA                MOV     R2,A
+001B         ?C0081:
+                                           ; SOURCE LINE # 598
+001B 120000      R     LCALL   ADCRead
+001E EF                MOV     A,R7
+001F 2500        R     ADD     A,RES+01H
+0021 F500        R     MOV     RES+01H,A
+0023 EE                MOV     A,R6
+0024 3500        R     ADDC    A,RES
+0026 F500        R     MOV     RES,A
+                                           ; SOURCE LINE # 599
+0028 0B                INC     R3
+0029 BB0001            CJNE    R3,#00H,?C0147
+002C 0A                INC     R2
+002D         ?C0147:
+002D EB                MOV     A,R3
+002E 6408              XRL     A,#08H
+0030 4A                ORL     A,R2
+0031 70E8              JNZ     ?C0081
+0033         ?C0082:
+                                           ; SOURCE LINE # 600
+0033 E500        R     MOV     A,RES+01H
+0035 AE00        R     MOV     R6,RES
+0037 7803              MOV     R0,#03H
+0039         ?C0148:
+0039 CE                XCH     A,R6
+003A C3                CLR     C
+003B 13                RRC     A
+003C CE                XCH     A,R6
+003D 13                RRC     A
+003E D8F9              DJNZ    R0,?C0148
+0040 F500        R     MOV     RES+01H,A
+0042 8E00        R     MOV     RES,R6
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 44  
+
+                                           ; SOURCE LINE # 603
+0044 FF                MOV     R7,A
+0045 E4                CLR     A
+0046 FC                MOV     R4,A
+0047 FD                MOV     R5,A
+0048 7BA6              MOV     R3,#0A6H
+004A 7A13              MOV     R2,#013H
+004C F9                MOV     R1,A
+004D F8                MOV     R0,A
+004E 120000      E     LCALL   ?C?LMUL
+0051 E4                CLR     A
+0052 FB                MOV     R3,A
+0053 7A04              MOV     R2,#04H
+0055 F9                MOV     R1,A
+0056 F8                MOV     R0,A
+0057 120000      E     LCALL   ?C?SLDIV
+;---- Variable 'tmpvcc' assigned to Register 'R6/R7' ----
+                                           ; SOURCE LINE # 604
+005A E500        R     MOV     A,update
+005C 6401              XRL     A,#01H
+005E 702A              JNZ     ?C0084
+                                           ; SOURCE LINE # 606
+0060 EE                MOV     A,R6
+0061 33                RLC     A
+0062 95E0              SUBB    A,ACC
+0064 FD                MOV     R5,A
+0065 FC                MOV     R4,A
+0066 E4                CLR     A
+0067 7B23              MOV     R3,#023H
+0069 FA                MOV     R2,A
+006A F9                MOV     R1,A
+006B F8                MOV     R0,A
+006C 120000      E     LCALL   ?C?LMUL
+006F E4                CLR     A
+0070 7B0A              MOV     R3,#0AH
+0072 FA                MOV     R2,A
+0073 F9                MOV     R1,A
+0074 F8                MOV     R0,A
+0075 120000      E     LCALL   ?C?SLDIV
+0078 8E00        R     MOV     vs,R6
+007A 8F00        R     MOV     vs+01H,R7
+                                           ; SOURCE LINE # 607
+007C 7C00              MOV     R4,#00H
+007E 7D03              MOV     R5,#03H
+0080 120000      E     LCALL   ?C?UIDIV
+0083 8E00        R     MOV     VCC,R6
+0085 8F00        R     MOV     VCC+01H,R7
+                                           ; SOURCE LINE # 608
+0087 120000      R     LCALL   _batteryPrecentage2
+                                           ; SOURCE LINE # 609
+008A         ?C0084:
+                                           ; SOURCE LINE # 611
+008A 020000      R     LJMP    ADCStop
+             ; FUNCTION _ReadVoltage (END)
+
+             ; FUNCTION timer0Init (BEGIN)
+                                           ; SOURCE LINE # 620
+                                           ; SOURCE LINE # 621
+0000 758C27            MOV     TH0,#027H
+                                           ; SOURCE LINE # 622
+0003 758AFF            MOV     TL0,#0FFH
+                                           ; SOURCE LINE # 623
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 45  
+
+0006 22                RET     
+             ; FUNCTION timer0Init (END)
+
+             ; FUNCTION timer0Start (BEGIN)
+                                           ; SOURCE LINE # 626
+                                           ; SOURCE LINE # 627
+0000 E4                CLR     A
+0001 F500        R     MOV     T0COUNTER,A
+0003 F500        R     MOV     T0COUNTER+01H,A
+                                           ; SOURCE LINE # 628
+0005 F500        R     MOV     RVCOUNTER,A
+0007 F500        R     MOV     RVCOUNTER+01H,A
+                                           ; SOURCE LINE # 629
+0009 F500        R     MOV     SCCOUNTER,A
+000B F500        R     MOV     SCCOUNTER+01H,A
+                                           ; SOURCE LINE # 630
+000D D2A9              SETB    ET0
+                                           ; SOURCE LINE # 631
+000F D2AF              SETB    EA
+                                           ; SOURCE LINE # 632
+0011 D28C              SETB    TR0
+                                           ; SOURCE LINE # 633
+0013 22                RET     
+             ; FUNCTION timer0Start (END)
+
+             ; FUNCTION timer0_ISR (BEGIN)
+0000 C0E0              PUSH    ACC
+0002 C0F0              PUSH    B
+0004 C083              PUSH    DPH
+0006 C082              PUSH    DPL
+0008 C0D0              PUSH    PSW
+000A 75D000            MOV     PSW,#00H
+000D C000              PUSH    AR0
+000F C001              PUSH    AR1
+0011 C002              PUSH    AR2
+0013 C003              PUSH    AR3
+0015 C004              PUSH    AR4
+0017 C005              PUSH    AR5
+0019 C006              PUSH    AR6
+001B C007              PUSH    AR7
+                                           ; SOURCE LINE # 636
+                                           ; SOURCE LINE # 637
+001D 0500        R     INC     T0COUNTER+01H
+001F E500        R     MOV     A,T0COUNTER+01H
+0021 7002              JNZ     ?C0149
+0023 0500        R     INC     T0COUNTER
+0025         ?C0149:
+                                           ; SOURCE LINE # 638
+0025 0500        R     INC     SCCOUNTER+01H
+0027 E500        R     MOV     A,SCCOUNTER+01H
+0029 7002              JNZ     ?C0150
+002B 0500        R     INC     SCCOUNTER
+002D         ?C0150:
+                                           ; SOURCE LINE # 639
+002D 0500        R     INC     LPCOUNTER+01H
+002F E500        R     MOV     A,LPCOUNTER+01H
+0031 7002              JNZ     ?C0151
+0033 0500        R     INC     LPCOUNTER
+0035         ?C0151:
+                                           ; SOURCE LINE # 642
+0035 D3                SETB    C
+0036 E500        R     MOV     A,T0COUNTER+01H
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 46  
+
+0038 9432              SUBB    A,#032H
+003A E500        R     MOV     A,T0COUNTER
+003C 6480              XRL     A,#080H
+003E 9480              SUBB    A,#080H
+0040 5003              JNC     $ + 5H
+0042 020000      R     LJMP    ?C0104
+                                           ; SOURCE LINE # 643
+0045 750000      R     MOV     T0COUNTER,#00H
+0048 750000      R     MOV     T0COUNTER+01H,#00H
+                                           ; SOURCE LINE # 644
+004B 0500        R     INC     RVCOUNTER+01H
+004D E500        R     MOV     A,RVCOUNTER+01H
+004F 7002              JNZ     ?C0152
+0051 0500        R     INC     RVCOUNTER
+0053         ?C0152:
+                                           ; SOURCE LINE # 647
+0053 900000      R     MOV     DPTR,#FIRST_INIT
+0056 E0                MOVX    A,@DPTR
+0057 B40106            CJNE    A,#01H,?C0089
+                                           ; SOURCE LINE # 648
+005A 750000      R     MOV     RVCOUNTER,#00H
+005D 750014      R     MOV     RVCOUNTER+01H,#014H
+                                           ; SOURCE LINE # 649
+0060         ?C0089:
+                                           ; SOURCE LINE # 652
+0060 E500        R     MOV     A,RVCOUNTER+01H
+0062 6414              XRL     A,#014H
+0064 4500        R     ORL     A,RVCOUNTER
+0066 700E              JNZ     ?C0090
+                                           ; SOURCE LINE # 653
+0068 900000      R     MOV     DPTR,#FIRST_INIT
+006B 7402              MOV     A,#02H
+006D F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 654
+006E 750000      R     MOV     CALCULATE_COUNT,#00H
+0071 750000      R     MOV     CALCULATE_COUNT+01H,#00H
+                                           ; SOURCE LINE # 655
+                                           ; SOURCE LINE # 656
+0074 801A              SJMP    ?C0167
+0076         ?C0090:
+                                           ; SOURCE LINE # 657
+0076 D3                SETB    C
+0077 E500        R     MOV     A,RVCOUNTER+01H
+0079 9414              SUBB    A,#014H
+007B E500        R     MOV     A,RVCOUNTER
+007D 6480              XRL     A,#080H
+007F 9480              SUBB    A,#080H
+0081 4014              JC      ?C0092
+0083 D3                SETB    C
+0084 E500        R     MOV     A,RVCOUNTER+01H
+0086 9416              SUBB    A,#016H
+0088 E500        R     MOV     A,RVCOUNTER
+008A 6480              XRL     A,#080H
+008C 9480              SUBB    A,#080H
+008E 5007              JNC     ?C0092
+                                           ; SOURCE LINE # 658
+0090         ?C0167:
+0090 7F01              MOV     R7,#01H
+0092 120000      R     LCALL   _ReadVoltage
+                                           ; SOURCE LINE # 659
+0095 8013              SJMP    ?C0091
+0097         ?C0092:
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 47  
+
+                                           ; SOURCE LINE # 660
+0097 D3                SETB    C
+0098 E500        R     MOV     A,RVCOUNTER+01H
+009A 9416              SUBB    A,#016H
+009C E500        R     MOV     A,RVCOUNTER
+009E 6480              XRL     A,#080H
+00A0 9480              SUBB    A,#080H
+00A2 4006              JC      ?C0091
+                                           ; SOURCE LINE # 661
+00A4 750000      R     MOV     RVCOUNTER,#00H
+00A7 750000      R     MOV     RVCOUNTER+01H,#00H
+                                           ; SOURCE LINE # 662
+00AA         ?C0091:
+                                           ; SOURCE LINE # 665
+00AA D3                SETB    C
+00AB E500        R     MOV     A,LPCOUNTER+01H
+00AD 9419              SUBB    A,#019H
+00AF E500        R     MOV     A,LPCOUNTER
+00B1 6480              XRL     A,#080H
+00B3 9480              SUBB    A,#080H
+00B5 4015              JC      ?C0095
+                                           ; SOURCE LINE # 666
+00B7 750000      R     MOV     LPCOUNTER,#00H
+00BA 750000      R     MOV     LPCOUNTER+01H,#00H
+                                           ; SOURCE LINE # 667
+00BD E500        R     MOV     A,LOW_POWER_MODE
+00BF 7004              JNZ     ?C0096
+                                           ; SOURCE LINE # 668
+00C1 D2B2              SETB    P32
+                                           ; SOURCE LINE # 669
+00C3 D2B3              SETB    P33
+                                           ; SOURCE LINE # 670
+00C5         ?C0096:
+                                           ; SOURCE LINE # 671
+00C5 E500        R     MOV     A,LOW_POWER_MODE
+00C7 B40302            CJNE    A,#03H,?C0095
+                                           ; SOURCE LINE # 672
+00CA D2B2              SETB    P32
+                                           ; SOURCE LINE # 673
+                                           ; SOURCE LINE # 674
+00CC         ?C0095:
+                                           ; SOURCE LINE # 682
+00CC 900000      R     MOV     DPTR,#MANUAL_MODE_ENABLED
+00CF E0                MOVX    A,@DPTR
+00D0 FF                MOV     R7,A
+00D1 700A              JNZ     ?C0098
+                                           ; SOURCE LINE # 683
+00D3 0500        R     INC     SCCOUNTER+01H
+00D5 E500        R     MOV     A,SCCOUNTER+01H
+00D7 700A              JNZ     ?C0099
+00D9 0500        R     INC     SCCOUNTER
+00DB         ?C0153:
+                                           ; SOURCE LINE # 684
+00DB 8006              SJMP    ?C0099
+00DD         ?C0098:
+                                           ; SOURCE LINE # 685
+                                           ; SOURCE LINE # 686
+00DD 750000      R     MOV     SCCOUNTER,#00H
+00E0 750000      R     MOV     SCCOUNTER+01H,#00H
+                                           ; SOURCE LINE # 687
+00E3         ?C0099:
+                                           ; SOURCE LINE # 690
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 48  
+
+00E3 D3                SETB    C
+00E4 E500        R     MOV     A,SCCOUNTER+01H
+00E6 9500        R     SUBB    A,SCTIMEOUT+01H
+00E8 E500        R     MOV     A,SCTIMEOUT
+00EA 6480              XRL     A,#080H
+00EC F8                MOV     R0,A
+00ED E500        R     MOV     A,SCCOUNTER
+00EF 6480              XRL     A,#080H
+00F1 98                SUBB    A,R0
+00F2 404D              JC      ?C0104
+00F4 EF                MOV     A,R7
+00F5 704A              JNZ     ?C0104
+                                           ; SOURCE LINE # 691
+00F7 E500        R     MOV     A,LOW_POWER_MODE
+00F9 6003              JZ      ?C0102
+00FB B40312            CJNE    A,#03H,?C0101
+00FE         ?C0102:
+                                           ; SOURCE LINE # 692
+00FE 750001      R     MOV     LOW_POWER_MODE,#01H
+                                           ; SOURCE LINE # 693
+0101 C2B2              CLR     P32
+                                           ; SOURCE LINE # 694
+0103 C2B3              CLR     P33
+                                           ; SOURCE LINE # 695
+0105 D292              SETB    LED
+                                           ; SOURCE LINE # 696
+0107 750000      R     MOV     RVCOUNTER,#00H
+010A 750000      R     MOV     RVCOUNTER+01H,#00H
+                                           ; SOURCE LINE # 697
+010D 120000      R     LCALL   ADCStop
+                                           ; SOURCE LINE # 698
+0110         ?C0101:
+                                           ; SOURCE LINE # 700
+0110 E500        R     MOV     A,SCTIMEOUT+01H
+0112 2419              ADD     A,#019H
+0114 FF                MOV     R7,A
+0115 E4                CLR     A
+0116 3500        R     ADDC    A,SCTIMEOUT
+0118 FE                MOV     R6,A
+0119 D3                SETB    C
+011A E500        R     MOV     A,SCCOUNTER+01H
+011C 9F                SUBB    A,R7
+011D EE                MOV     A,R6
+011E 6480              XRL     A,#080H
+0120 F8                MOV     R0,A
+0121 E500        R     MOV     A,SCCOUNTER
+0123 6480              XRL     A,#080H
+0125 98                SUBB    A,R0
+0126 4019              JC      ?C0104
+                                           ; SOURCE LINE # 701
+0128 750000      R     MOV     SCCOUNTER,#00H
+012B 750000      R     MOV     SCCOUNTER+01H,#00H
+                                           ; SOURCE LINE # 702
+012E C28C              CLR     TR0
+                                           ; SOURCE LINE # 703
+0130 C28E              CLR     TR1
+                                           ; SOURCE LINE # 704
+0132 900000      R     MOV     DPTR,#TMPWKTCL
+0135 E0                MOVX    A,@DPTR
+0136 F5AA              MOV     WKTCL,A
+                                           ; SOURCE LINE # 705
+0138 900000      R     MOV     DPTR,#TMPWKTCH
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 49  
+
+013B E0                MOVX    A,@DPTR
+013C F5AB              MOV     WKTCH,A
+                                           ; SOURCE LINE # 706
+013E 750002      R     MOV     LOW_POWER_MODE,#02H
+                                           ; SOURCE LINE # 707
+                                           ; SOURCE LINE # 708
+                                           ; SOURCE LINE # 709
+                                           ; SOURCE LINE # 710
+0141         ?C0104:
+0141 D007              POP     AR7
+0143 D006              POP     AR6
+0145 D005              POP     AR5
+0147 D004              POP     AR4
+0149 D003              POP     AR3
+014B D002              POP     AR2
+014D D001              POP     AR1
+014F D000              POP     AR0
+0151 D0D0              POP     PSW
+0153 D082              POP     DPL
+0155 D083              POP     DPH
+0157 D0F0              POP     B
+0159 D0E0              POP     ACC
+015B 32                RETI    
+             ; FUNCTION timer0_ISR (END)
+
+             ; FUNCTION _checkWakeupTime (BEGIN)
+                                           ; SOURCE LINE # 718
+;---- Variable 'currentTime' assigned to Register 'R4/R5/R6/R7' ----
+                                           ; SOURCE LINE # 720
+0000 E4                CLR     A
+0001 7B3C              MOV     R3,#03CH
+0003 FA                MOV     R2,A
+0004 F9                MOV     R1,A
+0005 F8                MOV     R0,A
+0006 120000      E     LCALL   ?C?SLDIV
+0009 E4                CLR     A
+000A 7B3C              MOV     R3,#03CH
+000C FA                MOV     R2,A
+000D F9                MOV     R1,A
+000E F8                MOV     R0,A
+000F 120000      E     LCALL   ?C?SLDIV
+0012 AF03              MOV     R7,AR3
+;---- Variable 'current_min' assigned to Register 'R6' ----
+0014 AE07              MOV     R6,AR7
+                                           ; SOURCE LINE # 723
+0016 900000      R     MOV     DPTR,#LAST_WAKE_MIN
+0019 E0                MOVX    A,@DPTR
+001A B50603            CJNE    A,AR6,?C0105
+                                           ; SOURCE LINE # 724
+001D 7F00              MOV     R7,#00H
+001F 22                RET     
+                                           ; SOURCE LINE # 725
+0020         ?C0105:
+                                           ; SOURCE LINE # 728
+0020 900000      R     MOV     DPTR,#WAKE_MODE
+0023 E0                MOVX    A,@DPTR
+0024 14                DEC     A
+0025 6021              JZ      ?C0111
+0027 14                DEC     A
+0028 6023              JZ      ?C0113
+002A 14                DEC     A
+002B 6025              JZ      ?C0115
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 50  
+
+002D 2403              ADD     A,#03H
+002F 7035              JNZ     ?C0107
+                                           ; SOURCE LINE # 729
+0031         ?C0108:
+                                           ; SOURCE LINE # 730
+0031 C3                CLR     C
+0032 E500        R     MOV     A,WKCOUNTER+01H
+0034 9500        R     SUBB    A,WKTIMEOUT+01H
+0036 E500        R     MOV     A,WKTIMEOUT
+0038 6480              XRL     A,#080H
+003A F8                MOV     R0,A
+003B E500        R     MOV     A,WKCOUNTER
+003D 6480              XRL     A,#080H
+003F 98                SUBB    A,R0
+0040 4003              JC      ?C0109
+0042 7F01              MOV     R7,#01H
+0044 22                RET     
+0045         ?C0109:
+0045 7F00              MOV     R7,#00H
+0047         ?C0110:
+0047 22                RET     
+                                           ; SOURCE LINE # 732
+0048         ?C0111:
+                                           ; SOURCE LINE # 733
+0048 EE                MOV     A,R6
+0049 701B              JNZ     ?C0107
+                                           ; SOURCE LINE # 734
+                                           ; SOURCE LINE # 735
+004B 8011              SJMP    ?C0169
+                                           ; SOURCE LINE # 736
+                                           ; SOURCE LINE # 737
+                                           ; SOURCE LINE # 739
+004D         ?C0113:
+                                           ; SOURCE LINE # 740
+004D BE1E16            CJNE    R6,#01EH,?C0107
+                                           ; SOURCE LINE # 741
+0050         ?C0168:
+                                           ; SOURCE LINE # 742
+0050 800C              SJMP    ?C0169
+                                           ; SOURCE LINE # 743
+                                           ; SOURCE LINE # 744
+                                           ; SOURCE LINE # 746
+0052         ?C0115:
+                                           ; SOURCE LINE # 747
+0052 EE                MOV     A,R6
+0053 75F00F            MOV     B,#0FH
+0056 120000      E     LCALL   ?C?SCDIV
+0059 AFF0              MOV     R7,B
+005B EF                MOV     A,R7
+005C 7008              JNZ     ?C0107
+                                           ; SOURCE LINE # 748
+005E         ?C0169:
+005E 900000      R     MOV     DPTR,#LAST_WAKE_MIN
+0061 EE                MOV     A,R6
+0062 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 749
+0063 7F01              MOV     R7,#01H
+0065 22                RET     
+                                           ; SOURCE LINE # 750
+                                           ; SOURCE LINE # 751
+                                           ; SOURCE LINE # 752
+0066         ?C0107:
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 51  
+
+                                           ; SOURCE LINE # 754
+0066 7F00              MOV     R7,#00H
+                                           ; SOURCE LINE # 755
+0068         ?C0106:
+0068 22                RET     
+             ; FUNCTION _checkWakeupTime (END)
+
+             ; FUNCTION timer1Init (BEGIN)
+                                           ; SOURCE LINE # 762
+                                           ; SOURCE LINE # 763
+0000 758D54            MOV     TH1,#054H
+                                           ; SOURCE LINE # 764
+0003 758BA3            MOV     TL1,#0A3H
+                                           ; SOURCE LINE # 765
+0006 22                RET     
+             ; FUNCTION timer1Init (END)
+
+             ; FUNCTION timer1Start (BEGIN)
+                                           ; SOURCE LINE # 768
+                                           ; SOURCE LINE # 769
+0000 D2AB              SETB    ET1
+                                           ; SOURCE LINE # 770
+0002 D2AF              SETB    EA
+                                           ; SOURCE LINE # 771
+0004 D28E              SETB    TR1
+                                           ; SOURCE LINE # 772
+0006 22                RET     
+             ; FUNCTION timer1Start (END)
+
+             ; FUNCTION timer1_ISR (BEGIN)
+0000 C0E0              PUSH    ACC
+0002 C0F0              PUSH    B
+0004 C083              PUSH    DPH
+0006 C082              PUSH    DPL
+0008 C0D0              PUSH    PSW
+000A 75D000            MOV     PSW,#00H
+000D C000              PUSH    AR0
+000F C004              PUSH    AR4
+0011 C005              PUSH    AR5
+0013 C006              PUSH    AR6
+0015 C007              PUSH    AR7
+                                           ; SOURCE LINE # 775
+                                           ; SOURCE LINE # 776
+0017 0500        R     INC     T1COUNTER
+                                           ; SOURCE LINE # 777
+0019 0500        R     INC     T1MSGCOUNTER
+                                           ; SOURCE LINE # 780
+001B D3                SETB    C
+001C E500        R     MOV     A,T1COUNTER
+001E 6480              XRL     A,#080H
+0020 9494              SUBB    A,#094H
+0022 402F              JC      ?C0119
+                                           ; SOURCE LINE # 781
+0024 750000      R     MOV     T1COUNTER,#00H
+                                           ; SOURCE LINE # 782
+0027 75C137            MOV     WDT_CONTR,#037H
+                                           ; SOURCE LINE # 783
+002A 900000      R     MOV     DPTR,#DATETIME
+002D E0                MOVX    A,@DPTR
+002E FC                MOV     R4,A
+002F A3                INC     DPTR
+0030 E0                MOVX    A,@DPTR
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 52  
+
+0031 FD                MOV     R5,A
+0032 A3                INC     DPTR
+0033 E0                MOVX    A,@DPTR
+0034 FE                MOV     R6,A
+0035 A3                INC     DPTR
+0036 E0                MOVX    A,@DPTR
+0037 2401              ADD     A,#01H
+0039 FF                MOV     R7,A
+003A E4                CLR     A
+003B 3E                ADDC    A,R6
+003C FE                MOV     R6,A
+003D E4                CLR     A
+003E 3D                ADDC    A,R5
+003F FD                MOV     R5,A
+0040 E4                CLR     A
+0041 3C                ADDC    A,R4
+0042 FC                MOV     R4,A
+0043 900000      R     MOV     DPTR,#DATETIME
+0046 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 785
+0049 E500        R     MOV     A,LOW_POWER_MODE
+004B 6003              JZ      ?C0121
+004D B40303            CJNE    A,#03H,?C0119
+0050         ?C0121:
+                                           ; SOURCE LINE # 786
+0050 750001      R     MOV     RTC_INT_Flag,#01H
+                                           ; SOURCE LINE # 787
+                                           ; SOURCE LINE # 788
+0053         ?C0119:
+                                           ; SOURCE LINE # 791
+0053 900000      R     MOV     DPTR,#GATE_ACTIVATING
+0056 E0                MOVX    A,@DPTR
+0057 B50006      R     CJNE    A,T1COUNTER,?C0122
+                                           ; SOURCE LINE # 792
+005A 74FF              MOV     A,#0FFH
+005C F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 793
+005D 120000      R     LCALL   RESETGATE
+                                           ; SOURCE LINE # 794
+0060         ?C0122:
+                                           ; SOURCE LINE # 797
+0060 E500        R     MOV     A,T1MSGCOUNTER
+0062 D3                SETB    C
+0063 94C8              SUBB    A,#0C8H
+0065 4006              JC      ?C0124
+                                           ; SOURCE LINE # 798
+0067 750000      R     MOV     T1MSGCOUNTER,#00H
+                                           ; SOURCE LINE # 799
+006A 750003      R     MOV     sendingFlag2,#03H
+                                           ; SOURCE LINE # 800
+                                           ; SOURCE LINE # 801
+006D         ?C0124:
+006D D007              POP     AR7
+006F D006              POP     AR6
+0071 D005              POP     AR5
+0073 D004              POP     AR4
+0075 D000              POP     AR0
+0077 D0D0              POP     PSW
+0079 D082              POP     DPL
+007B D083              POP     DPH
+007D D0F0              POP     B
+007F D0E0              POP     ACC
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 53  
+
+0081 32                RETI    
+             ; FUNCTION timer1_ISR (END)
+
+             ; FUNCTION main (BEGIN)
+                                           ; SOURCE LINE # 807
+                                           ; SOURCE LINE # 814
+0000 750000      R     MOV     F32K,#00H
+0003 750000      R     MOV     F32K+01H,#00H
+0006 7500F8      R     MOV     F32K+02H,#0F8H
+                                           ; SOURCE LINE # 815
+0009 120000      R     LCALL   GetWakeupTimerCount
+                                           ; SOURCE LINE # 818
+000C 75C127            MOV     WDT_CONTR,#027H
+                                           ; SOURCE LINE # 821
+000F 900000      R     MOV     DPTR,#FIRST_INIT
+0012 7401              MOV     A,#01H
+0014 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 822
+0015 E4                CLR     A
+0016 F500        R     MOV     LOW_POWER_MODE,A
+                                           ; SOURCE LINE # 823
+0018 F500        R     MOV     WKCOUNTER,A
+001A F500        R     MOV     WKCOUNTER+01H,A
+                                           ; SOURCE LINE # 824
+001C F500        R     MOV     WKTIMEOUT,A
+001E 750012      R     MOV     WKTIMEOUT+01H,#012H
+                                           ; SOURCE LINE # 825
+0021 75000B      R     MOV     SCTIMEOUT,#0BH
+0024 7500B8      R     MOV     SCTIMEOUT+01H,#0B8H
+                                           ; SOURCE LINE # 826
+0027 F500        R     MOV     RTC_INT_Flag,A
+                                           ; SOURCE LINE # 827
+0029 F500        R     MOV     datetimeCal,A
+                                           ; SOURCE LINE # 830
+002B 438E17            ORL     AUXR,#017H
+                                           ; SOURCE LINE # 831
+002E 538EFD            ANL     AUXR,#0FDH
+                                           ; SOURCE LINE # 834
+0031 90FE13            MOV     DPTR,#0FE13H
+0034 E0                MOVX    A,@DPTR
+0035 547F              ANL     A,#07FH
+0037 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 837
+0038 E4                CLR     A
+0039 F591              MOV     P1M1,A
+                                           ; SOURCE LINE # 838
+003B 439204            ORL     P1M0,#04H
+                                           ; SOURCE LINE # 839
+003E 5391F7            ANL     P1M1,#0F7H
+                                           ; SOURCE LINE # 840
+0041 439208            ORL     P1M0,#08H
+                                           ; SOURCE LINE # 841
+0044 5391EF            ANL     P1M1,#0EFH
+                                           ; SOURCE LINE # 842
+0047 439210            ORL     P1M0,#010H
+                                           ; SOURCE LINE # 843
+004A 53B1FB            ANL     P3M1,#0FBH
+                                           ; SOURCE LINE # 844
+004D 43B204            ORL     P3M0,#04H
+                                           ; SOURCE LINE # 845
+0050 53B1F7            ANL     P3M1,#0F7H
+                                           ; SOURCE LINE # 846
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 54  
+
+0053 43B208            ORL     P3M0,#08H
+                                           ; SOURCE LINE # 847
+0056 43B140            ORL     P3M1,#040H
+                                           ; SOURCE LINE # 848
+0059 53B2BF            ANL     P3M0,#0BFH
+                                           ; SOURCE LINE # 851
+005C D2B2              SETB    P32
+                                           ; SOURCE LINE # 852
+005E D2B3              SETB    P33
+                                           ; SOURCE LINE # 855
+0060 120000      R     LCALL   LoadConfig
+                                           ; SOURCE LINE # 858
+0063 750000      R     MOV     DISPLAY_NUM,#00H
+0066 7500BC      R     MOV     DISPLAY_NUM+01H,#0BCH
+                                           ; SOURCE LINE # 859
+0069 E4                CLR     A
+006A F500        R     MOV     VOLTAGE_NUM,A
+006C F500        R     MOV     VOLTAGE_NUM+01H,A
+                                           ; SOURCE LINE # 860
+006E F500        R     MOV     CALCULATE_COUNT,A
+0070 F500        R     MOV     CALCULATE_COUNT+01H,A
+                                           ; SOURCE LINE # 863
+0072 120000      R     LCALL   Uart2Init
+                                           ; SOURCE LINE # 866
+                                           ; SOURCE LINE # 867
+0075 120000      R     LCALL   timer0Init
+                                           ; SOURCE LINE # 868
+0078 120000      R     LCALL   timer0Start
+                                           ; SOURCE LINE # 869
+007B 120000      R     LCALL   timer1Init
+                                           ; SOURCE LINE # 870
+007E 120000      R     LCALL   timer1Start
+                                           ; SOURCE LINE # 873
+0081 900000      R     MOV     DPTR,#DATETIME
+0084 120000      E     LCALL   ?C?LSTKXDATA
+0087 67                DB      067H
+0088 F7                DB      0F7H
+0089 B6                DB      0B6H
+008A D4                DB      0D4H
+                                           ; SOURCE LINE # 874
+008B 120000      R     LCALL   RESETGATE
+                                           ; SOURCE LINE # 875
+008E 120000      R     LCALL   CLOSEGATE
+0091         ?C0125:
+                                           ; SOURCE LINE # 878
+                                           ; SOURCE LINE # 880
+0091 E500        R     MOV     A,sendingFlag2
+0093 B4010E            CJNE    A,#01H,?C0127
+                                           ; SOURCE LINE # 881
+0096 7B01              MOV     R3,#01H
+0098 7A00        R     MOV     R2,#HIGH BATRESP
+009A 7900        R     MOV     R1,#LOW BATRESP
+009C 7D09              MOV     R5,#09H
+009E 120000      R     LCALL   _Uart2SendStr
+                                           ; SOURCE LINE # 882
+00A1 E4                CLR     A
+00A2 F500        R     MOV     sendingFlag2,A
+                                           ; SOURCE LINE # 883
+00A4         ?C0127:
+                                           ; SOURCE LINE # 884
+00A4 E500        R     MOV     A,sendingFlag2
+00A6 B4020E            CJNE    A,#02H,?C0128
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 55  
+
+                                           ; SOURCE LINE # 885
+00A9 7B01              MOV     R3,#01H
+00AB 7A00        R     MOV     R2,#HIGH SLEEPRESP
+00AD 7900        R     MOV     R1,#LOW SLEEPRESP
+00AF 7D08              MOV     R5,#08H
+00B1 120000      R     LCALL   _Uart2SendStr
+                                           ; SOURCE LINE # 886
+00B4 E4                CLR     A
+00B5 F500        R     MOV     sendingFlag2,A
+                                           ; SOURCE LINE # 887
+00B7         ?C0128:
+                                           ; SOURCE LINE # 889
+00B7 E500        R     MOV     A,sendingFlag2
+00B9 6403              XRL     A,#03H
+00BB 6003              JZ      $ + 5H
+00BD 020000      R     LJMP    ?C0129
+                                           ; SOURCE LINE # 891
+00C0 900000      R     MOV     DPTR,#HARTBEATMSG
+00C3 7429              MOV     A,#029H
+00C5 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 892
+00C6 A3                INC     DPTR
+00C7 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 893
+00C8 A3                INC     DPTR
+00C9 740A              MOV     A,#0AH
+00CB F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 894
+00CC E4                CLR     A
+00CD A3                INC     DPTR
+00CE F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 895
+00CF A3                INC     DPTR
+00D0 7410              MOV     A,#010H
+00D2 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 896
+00D3 900000      R     MOV     DPTR,#DATETIME
+00D6 E0                MOVX    A,@DPTR
+00D7 FC                MOV     R4,A
+00D8 A3                INC     DPTR
+00D9 E0                MOVX    A,@DPTR
+00DA FD                MOV     R5,A
+00DB A3                INC     DPTR
+00DC E0                MOVX    A,@DPTR
+00DD FE                MOV     R6,A
+00DE A3                INC     DPTR
+00DF E0                MOVX    A,@DPTR
+00E0 FF                MOV     R7,A
+00E1 7B01              MOV     R3,#01H
+00E3 7A00        R     MOV     R2,#HIGH HARTBEATMSG
+00E5 7900        R     MOV     R1,#LOW HARTBEATMSG
+00E7 750005      E     MOV     ?_longToByteArray?BYTE+07H,#05H
+00EA 120000      E     LCALL   _longToByteArray
+                                           ; SOURCE LINE # 897
+00ED 900000      R     MOV     DPTR,#GATE_STATUS
+00F0 E0                MOVX    A,@DPTR
+00F1 900000      R     MOV     DPTR,#HARTBEATMSG+09H
+00F4 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 898
+00F5 900000      R     MOV     DPTR,#GATE_WORK_ENABLE
+00F8 A3                INC     DPTR
+00F9 E0                MOVX    A,@DPTR
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 56  
+
+00FA 900000      R     MOV     DPTR,#HARTBEATMSG+0AH
+00FD F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 899
+00FE 900000      R     MOV     DPTR,#GATE_START_TIME
+0101 E0                MOVX    A,@DPTR
+0102 FC                MOV     R4,A
+0103 A3                INC     DPTR
+0104 E0                MOVX    A,@DPTR
+0105 FD                MOV     R5,A
+0106 A3                INC     DPTR
+0107 E0                MOVX    A,@DPTR
+0108 FE                MOV     R6,A
+0109 A3                INC     DPTR
+010A E0                MOVX    A,@DPTR
+010B FF                MOV     R7,A
+010C 7B01              MOV     R3,#01H
+010E 7A00        R     MOV     R2,#HIGH HARTBEATMSG
+0110 7900        R     MOV     R1,#LOW HARTBEATMSG
+0112 75000B      E     MOV     ?_longToByteArray?BYTE+07H,#0BH
+0115 120000      E     LCALL   _longToByteArray
+                                           ; SOURCE LINE # 900
+0118 900000      R     MOV     DPTR,#GATE_WORK_DURATION
+011B E0                MOVX    A,@DPTR
+011C FC                MOV     R4,A
+011D A3                INC     DPTR
+011E E0                MOVX    A,@DPTR
+011F FD                MOV     R5,A
+0120 EC                MOV     A,R4
+0121 FF                MOV     R7,A
+0122 33                RLC     A
+0123 95E0              SUBB    A,ACC
+0125 EF                MOV     A,R7
+0126 900000      R     MOV     DPTR,#HARTBEATMSG+0FH
+0129 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 901
+012A A3                INC     DPTR
+012B ED                MOV     A,R5
+012C F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 902
+012D 900000      R     MOV     DPTR,#TMPWKTIMEOUT
+0130 E0                MOVX    A,@DPTR
+0131 FC                MOV     R4,A
+0132 A3                INC     DPTR
+0133 E0                MOVX    A,@DPTR
+0134 FD                MOV     R5,A
+0135 EC                MOV     A,R4
+0136 FF                MOV     R7,A
+0137 33                RLC     A
+0138 95E0              SUBB    A,ACC
+013A EF                MOV     A,R7
+013B 900000      R     MOV     DPTR,#HARTBEATMSG+011H
+013E F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 903
+013F A3                INC     DPTR
+0140 ED                MOV     A,R5
+0141 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 904
+0142 900000      R     MOV     DPTR,#TMPSCTIMEOUT
+0145 E0                MOVX    A,@DPTR
+0146 FC                MOV     R4,A
+0147 A3                INC     DPTR
+0148 E0                MOVX    A,@DPTR
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 57  
+
+0149 FD                MOV     R5,A
+014A EC                MOV     A,R4
+014B FF                MOV     R7,A
+014C 33                RLC     A
+014D 95E0              SUBB    A,ACC
+014F EF                MOV     A,R7
+0150 900000      R     MOV     DPTR,#HARTBEATMSG+013H
+0153 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 905
+0154 A3                INC     DPTR
+0155 ED                MOV     A,R5
+0156 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 906
+0157 900000      R     MOV     DPTR,#GATE_WORK_COUNTDOWN
+015A E0                MOVX    A,@DPTR
+015B FC                MOV     R4,A
+015C A3                INC     DPTR
+015D E0                MOVX    A,@DPTR
+015E FD                MOV     R5,A
+015F EC                MOV     A,R4
+0160 FF                MOV     R7,A
+0161 33                RLC     A
+0162 95E0              SUBB    A,ACC
+0164 EF                MOV     A,R7
+0165 900000      R     MOV     DPTR,#HARTBEATMSG+015H
+0168 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 907
+0169 A3                INC     DPTR
+016A ED                MOV     A,R5
+016B F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 910
+016C 900000      R     MOV     DPTR,#WAKE_MODE
+016F E0                MOVX    A,@DPTR
+0170 900000      R     MOV     DPTR,#HARTBEATMSG+017H
+0173 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 911
+0174 900000      R     MOV     DPTR,#MANUAL_MODE_ENABLED
+0177 E0                MOVX    A,@DPTR
+0178 900000      R     MOV     DPTR,#HARTBEATMSG+018H
+017B F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 913
+017C 7B01              MOV     R3,#01H
+017E 7A00        R     MOV     R2,#HIGH HARTBEATMSG
+0180 7900        R     MOV     R1,#LOW HARTBEATMSG
+0182 7D19              MOV     R5,#019H
+0184 120000      E     LCALL   _MODBUS_CRC16
+;---- Variable 'tmpCRC' assigned to Register 'R4/R5' ----
+0187 AD07              MOV     R5,AR7
+0189 AC06              MOV     R4,AR6
+                                           ; SOURCE LINE # 914
+018B EC                MOV     A,R4
+018C FF                MOV     R7,A
+018D EF                MOV     A,R7
+018E 900000      R     MOV     DPTR,#HARTBEATMSG+019H
+0191 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 915
+0192 A3                INC     DPTR
+0193 ED                MOV     A,R5
+0194 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 916
+0195 A3                INC     DPTR
+0196 740D              MOV     A,#0DH
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 58  
+
+0198 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 918
+0199 7B01              MOV     R3,#01H
+019B 7A00        R     MOV     R2,#HIGH HARTBEATMSG
+019D 7900        R     MOV     R1,#LOW HARTBEATMSG
+019F 7D1C              MOV     R5,#01CH
+01A1 120000      R     LCALL   _Uart2SendStr
+                                           ; SOURCE LINE # 919
+01A4 E4                CLR     A
+01A5 F500        R     MOV     sendingFlag2,A
+                                           ; SOURCE LINE # 920
+01A7         ?C0129:
+                                           ; SOURCE LINE # 922
+01A7 E500        R     MOV     A,sendingFlag2
+01A9 6404              XRL     A,#04H
+01AB 702E              JNZ     ?C0130
+                                           ; SOURCE LINE # 924
+01AD 900000      R     MOV     DPTR,#MANUAL_MODE_ENABLED
+01B0 E0                MOVX    A,@DPTR
+01B1 900000      R     MOV     DPTR,#manual_resp+05H
+01B4 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 925
+01B5 7B01              MOV     R3,#01H
+01B7 7A00        R     MOV     R2,#HIGH manual_resp
+01B9 7900        R     MOV     R1,#LOW manual_resp
+01BB 7D06              MOV     R5,#06H
+01BD 120000      E     LCALL   _MODBUS_CRC16
+01C0 8E00        R     MOV     crc,R6
+01C2 8F00        R     MOV     crc+01H,R7
+                                           ; SOURCE LINE # 926
+01C4 EF                MOV     A,R7
+01C5 900000      R     MOV     DPTR,#manual_resp+06H
+01C8 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 927
+01C9 E500        R     MOV     A,crc
+01CB A3                INC     DPTR
+01CC F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 928
+01CD 7B01              MOV     R3,#01H
+01CF 7A00        R     MOV     R2,#HIGH manual_resp
+01D1 7900        R     MOV     R1,#LOW manual_resp
+01D3 7D09              MOV     R5,#09H
+01D5 120000      R     LCALL   _Uart2SendStr
+                                           ; SOURCE LINE # 929
+01D8 E4                CLR     A
+01D9 F500        R     MOV     sendingFlag2,A
+                                           ; SOURCE LINE # 930
+01DB         ?C0130:
+                                           ; SOURCE LINE # 933
+01DB E500        R     MOV     A,LOW_POWER_MODE
+01DD 6402              XRL     A,#02H
+01DF 6003              JZ      $ + 5H
+01E1 020000      R     LJMP    ?C0131
+                                           ; SOURCE LINE # 934
+01E4 438702            ORL     PCON,#02H
+                                           ; SOURCE LINE # 935
+01E7 0500        R     INC     WKCOUNTER+01H
+01E9 E500        R     MOV     A,WKCOUNTER+01H
+01EB 7002              JNZ     ?C0154
+01ED 0500        R     INC     WKCOUNTER
+01EF         ?C0154:
+                                           ; SOURCE LINE # 936
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 59  
+
+01EF 75C137            MOV     WDT_CONTR,#037H
+                                           ; SOURCE LINE # 937
+01F2 900000      R     MOV     DPTR,#DATETIME
+01F5 E0                MOVX    A,@DPTR
+01F6 FC                MOV     R4,A
+01F7 A3                INC     DPTR
+01F8 E0                MOVX    A,@DPTR
+01F9 FD                MOV     R5,A
+01FA A3                INC     DPTR
+01FB E0                MOVX    A,@DPTR
+01FC FE                MOV     R6,A
+01FD A3                INC     DPTR
+01FE E0                MOVX    A,@DPTR
+01FF 240A              ADD     A,#0AH
+0201 FF                MOV     R7,A
+0202 E4                CLR     A
+0203 3E                ADDC    A,R6
+0204 FE                MOV     R6,A
+0205 E4                CLR     A
+0206 3D                ADDC    A,R5
+0207 FD                MOV     R5,A
+0208 E4                CLR     A
+0209 3C                ADDC    A,R4
+020A FC                MOV     R4,A
+020B 900000      R     MOV     DPTR,#DATETIME
+020E 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 938
+0211 0500        R     INC     datetimeCal
+                                           ; SOURCE LINE # 939
+0213 D3                SETB    C
+0214 E500        R     MOV     A,datetimeCal
+0216 6480              XRL     A,#080H
+0218 9485              SUBB    A,#085H
+021A 4022              JC      ?C0132
+                                           ; SOURCE LINE # 940
+021C E4                CLR     A
+021D F500        R     MOV     datetimeCal,A
+                                           ; SOURCE LINE # 941
+021F 900000      R     MOV     DPTR,#DATETIME
+0222 E0                MOVX    A,@DPTR
+0223 FC                MOV     R4,A
+0224 A3                INC     DPTR
+0225 E0                MOVX    A,@DPTR
+0226 FD                MOV     R5,A
+0227 A3                INC     DPTR
+0228 E0                MOVX    A,@DPTR
+0229 FE                MOV     R6,A
+022A A3                INC     DPTR
+022B E0                MOVX    A,@DPTR
+022C 2402              ADD     A,#02H
+022E FF                MOV     R7,A
+022F E4                CLR     A
+0230 3E                ADDC    A,R6
+0231 FE                MOV     R6,A
+0232 E4                CLR     A
+0233 3D                ADDC    A,R5
+0234 FD                MOV     R5,A
+0235 E4                CLR     A
+0236 3C                ADDC    A,R4
+0237 FC                MOV     R4,A
+0238 900000      R     MOV     DPTR,#DATETIME
+023B 120000      E     LCALL   ?C?LSTXDATA
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 60  
+
+                                           ; SOURCE LINE # 942
+023E         ?C0132:
+                                           ; SOURCE LINE # 956
+023E 900000      R     MOV     DPTR,#DATETIME
+0241 E0                MOVX    A,@DPTR
+0242 FC                MOV     R4,A
+0243 A3                INC     DPTR
+0244 E0                MOVX    A,@DPTR
+0245 FD                MOV     R5,A
+0246 A3                INC     DPTR
+0247 E0                MOVX    A,@DPTR
+0248 FE                MOV     R6,A
+0249 A3                INC     DPTR
+024A E0                MOVX    A,@DPTR
+024B FF                MOV     R7,A
+024C 120000      R     LCALL   _checkWakeupTime
+024F EF                MOV     A,R7
+0250 6018              JZ      ?C0133
+                                           ; SOURCE LINE # 957
+0252 E4                CLR     A
+0253 F500        R     MOV     WKCOUNTER,A
+0255 F500        R     MOV     WKCOUNTER+01H,A
+                                           ; SOURCE LINE # 958
+0257 F500        R     MOV     SCCOUNTER,A
+0259 F500        R     MOV     SCCOUNTER+01H,A
+                                           ; SOURCE LINE # 959
+025B F500        R     MOV     LOW_POWER_MODE,A
+                                           ; SOURCE LINE # 960
+025D F500        R     MOV     LPCOUNTER,A
+025F 750019      R     MOV     LPCOUNTER+01H,#019H
+                                           ; SOURCE LINE # 961
+0262 F500        R     MOV     T1COUNTER,A
+                                           ; SOURCE LINE # 962
+0264 F500        R     MOV     T1MSGCOUNTER,A
+                                           ; SOURCE LINE # 963
+0266 D28C              SETB    TR0
+                                           ; SOURCE LINE # 964
+0268 D28E              SETB    TR1
+                                           ; SOURCE LINE # 965
+026A         ?C0133:
+                                           ; SOURCE LINE # 968
+026A C3                CLR     C
+026B E500        R     MOV     A,WKCOUNTER+01H
+026D 9500        R     SUBB    A,WKTIMEOUT+01H
+026F E500        R     MOV     A,WKTIMEOUT
+0271 6480              XRL     A,#080H
+0273 F8                MOV     R0,A
+0274 E500        R     MOV     A,WKCOUNTER
+0276 6480              XRL     A,#080H
+0278 98                SUBB    A,R0
+0279 401A              JC      ?C0131
+                                           ; SOURCE LINE # 969
+027B E4                CLR     A
+027C F500        R     MOV     WKCOUNTER,A
+027E F500        R     MOV     WKCOUNTER+01H,A
+                                           ; SOURCE LINE # 970
+0280 750003      R     MOV     LOW_POWER_MODE,#03H
+                                           ; SOURCE LINE # 971
+0283 AE00        R     MOV     R6,SCTIMEOUT
+0285 AF00        R     MOV     R7,SCTIMEOUT+01H
+0287 FC                MOV     R4,A
+0288 7D02              MOV     R5,#02H
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 61  
+
+028A 120000      E     LCALL   ?C?SIDIV
+028D 8E00        R     MOV     SCCOUNTER,R6
+028F 8F00        R     MOV     SCCOUNTER+01H,R7
+                                           ; SOURCE LINE # 972
+0291 D28C              SETB    TR0
+                                           ; SOURCE LINE # 973
+0293 D28E              SETB    TR1
+                                           ; SOURCE LINE # 974
+                                           ; SOURCE LINE # 975
+0295         ?C0131:
+                                           ; SOURCE LINE # 978
+0295 E500        R     MOV     A,RTC_INT_Flag
+0297 6401              XRL     A,#01H
+0299 6003              JZ      $ + 5H
+029B 020000      R     LJMP    ?C0125
+                                           ; SOURCE LINE # 979
+029E F500        R     MOV     RTC_INT_Flag,A
+                                           ; SOURCE LINE # 981
+02A0 900000      R     MOV     DPTR,#MANUAL_MODE_ENABLED
+02A3 E0                MOVX    A,@DPTR
+02A4 6003              JZ      $ + 5H
+02A6 020000      R     LJMP    ?C0125
+                                           ; SOURCE LINE # 983
+02A9 D3                SETB    C
+02AA 900000      R     MOV     DPTR,#GATE_WORK_COUNTDOWN+01H
+02AD E0                MOVX    A,@DPTR
+02AE 9400              SUBB    A,#00H
+02B0 900000      R     MOV     DPTR,#GATE_WORK_COUNTDOWN
+02B3 E0                MOVX    A,@DPTR
+02B4 6480              XRL     A,#080H
+02B6 9480              SUBB    A,#080H
+02B8 400C              JC      ?C0137
+                                           ; SOURCE LINE # 984
+02BA A3                INC     DPTR
+02BB E0                MOVX    A,@DPTR
+02BC 24FF              ADD     A,#0FFH
+02BE F0                MOVX    @DPTR,A
+02BF 900000      R     MOV     DPTR,#GATE_WORK_COUNTDOWN
+02C2 E0                MOVX    A,@DPTR
+02C3 34FF              ADDC    A,#0FFH
+02C5 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 985
+02C6         ?C0137:
+                                           ; SOURCE LINE # 988
+02C6 E4                CLR     A
+02C7 FF                MOV     R7,A
+02C8 120000      R     LCALL   _doGateStartChecker
+02CB 8F00        R     MOV     gateStartCheckRes,R7
+                                           ; SOURCE LINE # 989
+02CD E500        R     MOV     A,gateStartCheckRes
+02CF 6007              JZ      ?C0138
+                                           ; SOURCE LINE # 990
+02D1 E4                CLR     A
+02D2 F500        R     MOV     SCCOUNTER,A
+02D4 F500        R     MOV     SCCOUNTER+01H,A
+                                           ; SOURCE LINE # 991
+02D6 F500        R     MOV     LOW_POWER_MODE,A
+                                           ; SOURCE LINE # 992
+02D8         ?C0138:
+                                           ; SOURCE LINE # 995
+02D8 E500        R     MOV     A,gateStartCheckRes
+02DA 24FD              ADD     A,#0FDH
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 62  
+
+02DC 601F              JZ      ?C0141
+02DE 2402              ADD     A,#02H
+02E0 6003              JZ      $ + 5H
+02E2 020000      R     LJMP    ?C0125
+                                           ; SOURCE LINE # 996
+02E5         ?C0140:
+                                           ; SOURCE LINE # 997
+02E5 900000      R     MOV     DPTR,#GATE_WORK_DURATION
+02E8 E0                MOVX    A,@DPTR
+02E9 FF                MOV     R7,A
+02EA A3                INC     DPTR
+02EB E0                MOVX    A,@DPTR
+02EC 900000      R     MOV     DPTR,#GATE_WORK_COUNTDOWN
+02EF CF                XCH     A,R7
+02F0 F0                MOVX    @DPTR,A
+02F1 A3                INC     DPTR
+02F2 EF                MOV     A,R7
+02F3 F0                MOVX    @DPTR,A
+                                           ; SOURCE LINE # 998
+02F4 120000      R     LCALL   OPENGATE
+                                           ; SOURCE LINE # 999
+02F7 750003      R     MOV     sendingFlag2,#03H
+                                           ; SOURCE LINE # 1000
+02FA 020000      R     LJMP    ?C0125
+                                           ; SOURCE LINE # 1002
+02FD         ?C0141:
+                                           ; SOURCE LINE # 1003
+02FD 120000      R     LCALL   CLOSEGATE
+                                           ; SOURCE LINE # 1004
+0300 900000      R     MOV     DPTR,#GATE_START_TIME
+0303 E0                MOVX    A,@DPTR
+0304 F8                MOV     R0,A
+0305 A3                INC     DPTR
+0306 E0                MOVX    A,@DPTR
+0307 F9                MOV     R1,A
+0308 A3                INC     DPTR
+0309 E0                MOVX    A,@DPTR
+030A FA                MOV     R2,A
+030B A3                INC     DPTR
+030C E0                MOVX    A,@DPTR
+030D FB                MOV     R3,A
+030E 900000      R     MOV     DPTR,#DATETIME
+0311 E0                MOVX    A,@DPTR
+0312 FC                MOV     R4,A
+0313 A3                INC     DPTR
+0314 E0                MOVX    A,@DPTR
+0315 FD                MOV     R5,A
+0316 A3                INC     DPTR
+0317 E0                MOVX    A,@DPTR
+0318 FE                MOV     R6,A
+0319 A3                INC     DPTR
+031A E0                MOVX    A,@DPTR
+031B C3                CLR     C
+031C 9B                SUBB    A,R3
+031D FF                MOV     R7,A
+031E EE                MOV     A,R6
+031F 9A                SUBB    A,R2
+0320 FE                MOV     R6,A
+0321 ED                MOV     A,R5
+0322 99                SUBB    A,R1
+0323 FD                MOV     R5,A
+0324 EC                MOV     A,R4
+C51 COMPILER V9.54   MAIN                                                                  05/07/2025 14:49:15 PAGE 63  
+
+0325 98                SUBB    A,R0
+0326 FC                MOV     R4,A
+0327 E4                CLR     A
+0328 7B58              MOV     R3,#058H
+032A 7A02              MOV     R2,#02H
+032C F9                MOV     R1,A
+032D F8                MOV     R0,A
+032E D3                SETB    C
+032F 120000      E     LCALL   ?C?ULCMP
+0332 4022              JC      ?C0142
+                                           ; SOURCE LINE # 1005
+0334 900000      R     MOV     DPTR,#GATE_START_TIME
+0337 E0                MOVX    A,@DPTR
+0338 FC                MOV     R4,A
+0339 A3                INC     DPTR
+033A E0                MOVX    A,@DPTR
+033B FD                MOV     R5,A
+033C A3                INC     DPTR
+033D E0                MOVX    A,@DPTR
+033E FE                MOV     R6,A
+033F A3                INC     DPTR
+0340 E0                MOVX    A,@DPTR
+0341 9458              SUBB    A,#058H
+0343 FF                MOV     R7,A
+0344 EE                MOV     A,R6
+0345 9402              SUBB    A,#02H
+0347 FE                MOV     R6,A
+0348 ED                MOV     A,R5
+0349 9400              SUBB    A,#00H
+034B FD                MOV     R5,A
+034C EC                MOV     A,R4
+034D 9400              SUBB    A,#00H
+034F FC                MOV     R4,A
+0350 900000      R     MOV     DPTR,#GATE_START_TIME
+0353 120000      E     LCALL   ?C?LSTXDATA
+                                           ; SOURCE LINE # 1006
+0356         ?C0142:
+                                           ; SOURCE LINE # 1007
+0356 750003      R     MOV     sendingFlag2,#03H
+                                           ; SOURCE LINE # 1008
+0359 020000      R     LJMP    ?C0125
+             ; FUNCTION main (END)
+
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   3636    ----
+   CONSTANT SIZE    =   ----    ----
+   XDATA SIZE       =    112      30
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =     35      23
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =   ----    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  2 WARNING(S),  0 ERROR(S)
